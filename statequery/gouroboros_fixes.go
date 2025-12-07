@@ -403,10 +403,15 @@ func (s *Service) QueryDebugEpochState() (*AdaPotsInfo, error) {
 		return nil, err
 	}
 
-	// The result is cbor.RawMessage (which is []byte)
+	// The result is *DebugEpochStateResult from gouroboros
 	var rawBytes []byte
 	if epochStateResult != nil {
-		rawBytes = []byte(*epochStateResult)
+		// Try to encode it back to CBOR bytes
+		var err error
+		rawBytes, err = cbor.Encode(epochStateResult)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode epoch state result: %w", err)
+		}
 	}
 
 	return ParseAdaPots(rawBytes)

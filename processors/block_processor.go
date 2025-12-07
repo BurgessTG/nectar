@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"nectar/config"
 	"nectar/constants"
 	"nectar/database"
 	unifiederrors "nectar/errors"
@@ -39,43 +40,37 @@ type StateQueryService interface {
 
 // BlockProcessor handles processing blocks and storing them in TiDB
 type BlockProcessor struct {
-	db                   *gorm.DB
-	stakeAddressCache    *StakeAddressCache
-	errorCollector       *ErrorCollector
-	certificateProcessor *CertificateProcessor
-	withdrawalProcessor  *WithdrawalProcessor
-	assetProcessor       *AssetProcessor
-	metadataProcessor    *MetadataProcessor
-	governanceProcessor  *GovernanceProcessor
-	scriptProcessor      *ScriptProcessor
-	adaPotsCalculator    *AdaPotsCalculator
-	epochParamsProvider  *EpochParamsProvider
-	stateQueryService    StateQueryService
-	txSemaphore          chan struct{} // Limits concurrent transaction processing
-	slotLeaderCache      *LRUCache  // LRU cache for slot leader hashes
-	currentEraConfig     *EraConfig // Current era configuration
-	currentEpoch         uint64     // Track current epoch for era detection
+	db                        *gorm.DB
+	config                    *config.IndexingConfig // Selective indexing configuration
+	stakeAddressCache         *StakeAddressCache
+	errorCollector            *ErrorCollector
+	assetProcessor            *AssetProcessor
+	metadataProcessor         *MetadataProcessor
+	scriptProcessor           *ScriptProcessor
+	walletConnectionProcessor *WalletConnectionProcessor
+	epochParamsProvider       *EpochParamsProvider
+	stateQueryService         StateQueryService
+	txSemaphore               chan struct{} // Limits concurrent transaction processing
+	currentEraConfig          *EraConfig    // Current era configuration
+	currentEpoch              uint64        // Track current epoch for era detection
 }
 
 // NewBlockProcessor creates a new block processor
-func NewBlockProcessor(db *gorm.DB) *BlockProcessor {
+func NewBlockProcessor(db *gorm.DB, cfg *config.IndexingConfig) *BlockProcessor {
 	stakeAddressCache := NewStakeAddressCache(db)
 	bp := &BlockProcessor{
-		db:                   db,
-		stakeAddressCache:    stakeAddressCache,
-		errorCollector:       GetGlobalErrorCollector(),
-		certificateProcessor: NewCertificateProcessor(db, stakeAddressCache),
-		withdrawalProcessor:  NewWithdrawalProcessor(db),
-		assetProcessor:       NewAssetProcessor(db),
-		metadataProcessor:    NewMetadataProcessor(db),
-		governanceProcessor:  NewGovernanceProcessor(db),
-		scriptProcessor:      NewScriptProcessor(db),
-		adaPotsCalculator:    NewAdaPotsCalculator(db),
-		epochParamsProvider:  NewEpochParamsProvider(db),
-		txSemaphore:          make(chan struct{}, 32), // Increased to 32 for our powerful system
-		slotLeaderCache:      NewLRUCache(constants.CacheMaxEntries),
-		currentEraConfig:     GetEraConfig(0), // Start with Byron config
-		currentEpoch:         0,
+		db:                        db,
+		config:                    cfg,
+		stakeAddressCache:         stakeAddressCache,
+		errorCollector:            GetGlobalErrorCollector(),
+		assetProcessor:            NewAssetProcessor(db),
+		metadataProcessor:         NewMetadataProcessor(db),
+		scriptProcessor:           NewScriptProcessor(db),
+		walletConnectionProcessor: NewWalletConnectionProcessor(db),
+		epochParamsProvider:       NewEpochParamsProvider(db),
+		txSemaphore:               make(chan struct{}, 32), // Increased to 32 for our powerful system
+		currentEraConfig:          GetEraConfig(0),         // Start with Byron config
+		currentEpoch:              0,
 	}
 	return bp
 }
@@ -85,21 +80,21 @@ func (bp *BlockProcessor) ProcessBlock(ctx context.Context, block ledger.Block, 
 	slotNumber := block.Header().SlotNumber()
 	blockNumber := block.BlockNumber()
 	epochNo := bp.getEpochForSlot(slotNumber, blockType)
-	
+
 	// Check if we need to update era configuration
 	if uint64(epochNo) != bp.currentEpoch {
 		bp.updateEraConfig(epochNo)
 	}
-	
+
 	// Log block processing start
-	if blockNumber % 100 == 0 {
+	if blockNumber%100 == 0 {
 		log.Printf("[BLOCK] Processing block %d (slot %d, era %s)", blockNumber, slotNumber, bp.getEraName(blockType))
 	}
-	
+
 	// Special handling for Byron-Shelley boundary
 	if slotNumber >= 4492800 && slotNumber <= 4493000 {
 		// Processing boundary block
-		
+
 		// Add extra debugging for the problematic slot
 		if slotNumber == 4492900 {
 			log.Printf("[DEBUG] Slot 4492900 - Block type: %d, Era: %s", blockType, bp.getEraName(blockType))
@@ -107,11 +102,11 @@ func (bp *BlockProcessor) ProcessBlock(ctx context.Context, block ledger.Block, 
 			log.Printf("[DEBUG] Block hash: %x", block.Header().Hash())
 			log.Printf("[DEBUG] Epoch calculated: %d", bp.getEpochForSlot(slotNumber, blockType))
 			log.Printf("[DEBUG] Block time: %v", bp.getBlockTime(slotNumber, blockType))
-			
+
 			// Check first few transactions for any issues
 			txs := block.Transactions()
 			if len(txs) > 0 {
-				log.Printf("[DEBUG] First transaction has %d inputs, %d outputs", 
+				log.Printf("[DEBUG] First transaction has %d inputs, %d outputs",
 					len(txs[0].Inputs()), len(txs[0].Outputs()))
 				if len(txs[0].Outputs()) > 0 {
 					firstOutput := txs[0].Outputs()[0]
@@ -120,21 +115,27 @@ func (bp *BlockProcessor) ProcessBlock(ctx context.Context, block ledger.Block, 
 			}
 		}
 	}
-	
-	// Ensure we start with a healthy connection
-	if err := bp.EnsureHealthyConnection(); err != nil {
+
+	// Ensure we start with a healthy connection (use context for timeout)
+	if err := bp.EnsureHealthyConnectionWithContext(ctx); err != nil {
 		return fmt.Errorf("connection unhealthy before processing: %w", err)
 	}
 
-	// Process block header in its own transaction with proper isolation and retry logic
+	// Check context before starting work
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// Process block header in its own transaction with retry logic
+	// Note: Transaction isolation is set at session level in database/tidb.go
+	// Don't pass context to transaction - let worker-level timeout handle cancellation
 	var dbBlock *models.Block
 	startTime := time.Now()
 	err := database.RetryTransaction(bp.db, func(tx *gorm.DB) error {
-		// Set transaction isolation level for better concurrency
-		if err := tx.Exec("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").Error; err != nil {
-			unifiederrors.Get().Warning("BlockProcessor", "SetTransactionIsolation", fmt.Sprintf("Failed to set transaction isolation: %v", err))
+		// Check context before processing (fast bail-out)
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		
 		var err error
 		dbBlock, err = bp.processBlockHeader(ctx, tx, block, blockType)
 		return err
@@ -142,10 +143,15 @@ func (bp *BlockProcessor) ProcessBlock(ctx context.Context, block ledger.Block, 
 	if err != nil {
 		return fmt.Errorf("failed to process block header: %w", err)
 	}
-	
+
 	headerTime := time.Since(startTime)
 	if headerTime > 5*time.Second {
 		log.Printf("[PERF] Block header processing took %v for block %d", headerTime, blockNumber)
+	}
+
+	// Check context before processing transactions
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	// Process transactions with smaller scope (each tx in its own DB transaction)
@@ -153,11 +159,11 @@ func (bp *BlockProcessor) ProcessBlock(ctx context.Context, block ledger.Block, 
 	if err := bp.processEraAwareTransactions(ctx, bp.db, dbBlock, block, blockType); err != nil {
 		return fmt.Errorf("failed to process transactions: %w", err)
 	}
-	
+
 	txTime := time.Since(txStartTime)
 	totalTime := time.Since(startTime)
 	if totalTime > 10*time.Second {
-		log.Printf("[PERF] Block %d processing: header=%v, txs=%v, total=%v (tx count=%d)", 
+		log.Printf("[PERF] Block %d processing: header=%v, txs=%v, total=%v (tx count=%d)",
 			blockNumber, headerTime, txTime, totalTime, len(block.Transactions()))
 	}
 
@@ -176,10 +182,19 @@ func (bp *BlockProcessor) processBlockHeader(ctx context.Context, tx *gorm.DB, b
 	blockNumber64 := block.BlockNumber()
 	blockNumber := uint32(blockNumber64)
 
-	// Get slot leader hash
-	slotLeaderHash, err := bp.getOrCreateSlotLeader(tx, block, blockType)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get slot leader: %w", err)
+	// Extract slot leader hash directly without database insertion
+	var slotLeaderHash []byte
+	if blockType == BlockTypeByronEBB || blockType == BlockTypeByronMain {
+		slotLeaderHash = hash[:28]
+	} else {
+		switch header := blockHeader.(type) {
+		case *ledger.ShelleyBlockHeader:
+			slotLeaderHash = header.Body.IssuerVkey[:28]
+		case *ledger.BabbageBlockHeader:
+			slotLeaderHash = header.Body.IssuerVkey[:28]
+		default:
+			slotLeaderHash = hash[:28]
+		}
 	}
 
 	// Create the block record with hash as primary key
@@ -247,38 +262,35 @@ func (bp *BlockProcessor) processEraAwareTransactions(ctx context.Context, db *g
 	for idx, tx := range transactions {
 		// Special debugging for Byron-Shelley boundary transactions
 		// Skip verbose logging for boundary blocks
-		
+
 		// Log slow transactions
 		txStartTime := time.Now()
-		
+
 		// Use RetryTransaction for automatic retry with exponential backoff
+		// Note: Transaction isolation is set at session level in database/tidb.go
+		slotNo := *dbBlock.SlotNo
 		err := database.RetryTransaction(db, func(dbTx *gorm.DB) error {
-			// Set transaction isolation level
-			if err := dbTx.Exec("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").Error; err != nil {
-				unifiederrors.Get().Warning("BlockProcessor", "SetTransactionIsolation", 
-					fmt.Sprintf("Failed to set transaction isolation: %v", err))
-			}
-			return bp.processTransaction(ctx, dbTx, blockHash, blockNumber, blockTime, idx, tx, blockType)
+			return bp.processTransaction(ctx, dbTx, blockHash, blockNumber, blockTime, slotNo, idx, tx, blockType)
 		})
-		
+
 		txProcessTime := time.Since(txStartTime)
 		if txProcessTime > 5*time.Second {
 			log.Printf("[PERF] Transaction %d in block %d took %v to process", idx, blockNumber, txProcessTime)
 		}
-		
+
 		if err != nil {
 			// Check if it's a duplicate key error (already processed)
 			if strings.Contains(err.Error(), "Duplicate entry") {
 				// Don't log this - it's normal during parallel processing
 				continue // Not an error, continue with next transaction
 			}
-			
+
 			// For Byron-Shelley boundary, add more context to errors
 			if blockNumber >= 4492800 && blockNumber <= 4493000 {
-				return fmt.Errorf("transaction %d at Byron-Shelley boundary (block %d): %w", 
+				return fmt.Errorf("transaction %d at Byron-Shelley boundary (block %d): %w",
 					idx, blockNumber, err)
 			}
-			
+
 			return fmt.Errorf("transaction %d: %w", idx, err)
 		}
 	}
@@ -287,7 +299,7 @@ func (bp *BlockProcessor) processEraAwareTransactions(ctx context.Context, db *g
 }
 
 // processTransaction processes a single transaction in its own DB transaction
-func (bp *BlockProcessor) processTransaction(ctx context.Context, tx *gorm.DB, blockHash []byte, blockNumber uint64, blockTime time.Time, blockIndex int, transaction ledger.Transaction, blockType uint) error {
+func (bp *BlockProcessor) processTransaction(ctx context.Context, tx *gorm.DB, blockHash []byte, blockNumber uint64, blockTime time.Time, slotNo uint64, blockIndex int, transaction ledger.Transaction, blockType uint) error {
 	hash := transaction.Hash()
 	txHash := hash[:]
 
@@ -324,100 +336,158 @@ func (bp *BlockProcessor) processTransaction(ctx context.Context, tx *gorm.DB, b
 
 	// Process transaction components sequentially to avoid "commands out of sync" errors
 	// IMPORTANT: We cannot use concurrent goroutines on the same database transaction
-	
-	// Process inputs
-	if err := bp.processTransactionInputs(ctx, tx, txHash, transaction, blockType); err != nil {
-		unifiederrors.Get().Warning("BlockProcessor", "ProcessInputs", fmt.Sprintf("Failed to process inputs for tx %d: %v", blockIndex, err))
-	}
 
-	// Process outputs
-	if err := bp.processTransactionOutputs(ctx, tx, txHash, transaction, blockType); err != nil {
-		if strings.Contains(err.Error(), "Data too long") || strings.Contains(err.Error(), "failed to batch insert") {
-			unifiederrors.Get().DatabaseError("BlockProcessor", "ProcessOutputs", fmt.Errorf("Component error in tx %d: outputs: %v", blockIndex, err))
-		} else {
-			unifiederrors.Get().Warning("BlockProcessor", "ProcessOutputs", fmt.Sprintf("Failed to process outputs for tx %d: %v", blockIndex, err))
+	// Process inputs (CONDITIONAL - only if UTxOs/Inputs enabled)
+	if bp.config.Inputs || bp.config.UTXOs {
+		if err := bp.processTransactionInputs(ctx, tx, txHash, transaction, blockType); err != nil {
+			unifiederrors.Get().Warning("BlockProcessor", "ProcessInputs", fmt.Sprintf("Failed to process inputs for tx %d: %v", blockIndex, err))
 		}
 	}
 
-	// Process metadata
-	if metadata := transaction.Metadata(); metadata != nil {
-		if metaValue := metadata.Value(); metaValue != nil {
-			if err := bp.metadataProcessor.ProcessMetadata(tx, txHash, metadata); err != nil {
-				unifiederrors.Get().Warning("BlockProcessor", "ProcessMetadata", fmt.Sprintf("Failed to process metadata: %v", err))
+	// Process outputs (CONDITIONAL - only if UTxOs/Outputs enabled)
+	if bp.config.Outputs || bp.config.UTXOs {
+		if err := bp.processTransactionOutputs(ctx, tx, txHash, transaction, blockType); err != nil {
+			if strings.Contains(err.Error(), "Data too long") || strings.Contains(err.Error(), "failed to batch insert") {
+				unifiederrors.Get().DatabaseError("BlockProcessor", "ProcessOutputs", fmt.Errorf("Component error in tx %d: outputs: %v", blockIndex, err))
+			} else {
+				unifiederrors.Get().Warning("BlockProcessor", "ProcessOutputs", fmt.Sprintf("Failed to process outputs for tx %d: %v", blockIndex, err))
 			}
 		}
 	}
 
-	// Process withdrawals
-	if withdrawals := bp.getTransactionWithdrawals(transaction, blockType); len(withdrawals) > 0 {
-		if err := bp.withdrawalProcessor.ProcessWithdrawals(ctx, tx, txHash, withdrawals, blockType); err != nil {
-			unifiederrors.Get().Warning("BlockProcessor", "ProcessWithdrawals", fmt.Sprintf("Failed to process withdrawals: %v", err))
+	// Process metadata (CONDITIONAL - with label filtering)
+	if bp.config.Metadata {
+		if metadata := transaction.Metadata(); metadata != nil {
+			if metaValue := metadata.Value(); metaValue != nil {
+				if err := bp.processFilteredMetadata(ctx, tx, txHash, metadata); err != nil {
+					unifiederrors.Get().Warning("BlockProcessor", "ProcessMetadata", fmt.Sprintf("Failed to process metadata: %v", err))
+				}
+			}
 		}
 	}
 
-	// Process minting/burning
-	if mint := bp.getTransactionMint(transaction, blockType); len(mint) > 0 {
-		if err := bp.assetProcessor.ProcessMint(tx, txHash, mint); err != nil {
-			unifiederrors.Get().Warning("BlockProcessor", "ProcessMint", fmt.Sprintf("Failed to process mint: %v", err))
+	// Process minting/burning (CONDITIONAL)
+	if bp.config.Minting || bp.config.Assets {
+		if mint := bp.getTransactionMint(transaction, blockType); len(mint) > 0 {
+			if err := bp.assetProcessor.ProcessMint(tx, txHash, mint); err != nil {
+				unifiederrors.Get().Warning("BlockProcessor", "ProcessMint", fmt.Sprintf("Failed to process mint: %v", err))
+			}
 		}
 	}
 
-	// Process scripts
-	if blockType >= BlockTypeAlonzo {
-		// Log every 100th transaction in smart contract eras to verify we're processing them
-		if blockIndex % 100 == 0 {
-			log.Printf("[SCRIPT_CHECK] Processing tx %x at index %d in era %d", txHash, blockIndex, blockType)
+	// Process scripts (CONDITIONAL)
+	if bp.config.Scripts {
+		if blockType >= BlockTypeAlonzo {
+			// Log every 100th transaction in smart contract eras to verify we're processing them
+			if blockIndex%100 == 0 {
+				log.Printf("[SCRIPT_CHECK] Processing tx %x at index %d in era %d", txHash, blockIndex, blockType)
+			}
+
+			// For the first few transactions in Babbage, log detailed info
+			if blockType == BlockTypeBabbage && blockIndex < 5 {
+				log.Printf("[BABBAGE_TX] Processing transaction %d: hash=%x, type=%T", blockIndex, txHash, transaction)
+			}
 		}
-		
-		// For the first few transactions in Babbage, log detailed info
-		if blockType == BlockTypeBabbage && blockIndex < 5 {
-			log.Printf("[BABBAGE_TX] Processing transaction %d: hash=%x, type=%T", blockIndex, txHash, transaction)
+		if err := bp.scriptProcessor.ProcessTransaction(tx, txHash, transaction, blockType); err != nil {
+			unifiederrors.Get().Warning("BlockProcessor", "ProcessScripts", fmt.Sprintf("Failed to process scripts: %v", err))
 		}
-	}
-	if err := bp.scriptProcessor.ProcessTransaction(tx, txHash, transaction, blockType); err != nil {
-		unifiederrors.Get().Warning("BlockProcessor", "ProcessScripts", fmt.Sprintf("Failed to process scripts: %v", err))
 	}
 
-	// Process collateral inputs (Alonzo+)
-	if blockType >= BlockTypeAlonzo {
+	// Process collateral inputs (CONDITIONAL - Alonzo+)
+	if bp.config.Collateral && blockType >= BlockTypeAlonzo {
 		if err := bp.processCollateralInputs(ctx, tx, txHash, transaction, blockType); err != nil {
 			unifiederrors.Get().Warning("BlockProcessor", "ProcessCollateral", fmt.Sprintf("Failed to process collateral inputs: %v", err))
 		}
 	}
 
-	// Process collateral return (Babbage+)
-	if blockType >= BlockTypeBabbage {
+	// Process collateral return (CONDITIONAL - Babbage+)
+	if bp.config.Collateral && blockType >= BlockTypeBabbage {
 		if err := bp.processCollateralReturn(ctx, tx, txHash, transaction, blockType); err != nil {
 			unifiederrors.Get().Warning("BlockProcessor", "ProcessCollateralReturn", fmt.Sprintf("Failed to process collateral return: %v", err))
 		}
 	}
 
-	// Process reference inputs (Babbage+)
-	if blockType >= BlockTypeBabbage {
+	// Process reference inputs (CONDITIONAL - Babbage+)
+	if bp.config.Collateral && blockType >= BlockTypeBabbage {
 		if err := bp.processReferenceInputs(ctx, tx, txHash, transaction, blockType); err != nil {
 			unifiederrors.Get().Warning("BlockProcessor", "ProcessReferenceInputs", fmt.Sprintf("Failed to process reference inputs: %v", err))
 		}
 	}
 
-	// Process required signers (Alonzo+)
-	if blockType >= BlockTypeAlonzo {
+	// Process required signers (CONDITIONAL - Alonzo+)
+	if bp.config.Scripts && blockType >= BlockTypeAlonzo {
 		if err := bp.processRequiredSigners(ctx, tx, txHash, transaction, blockType); err != nil {
 			unifiederrors.Get().Warning("BlockProcessor", "ProcessRequiredSigners", fmt.Sprintf("Failed to process required signers: %v", err))
 		}
 	}
 
-	// Process dependent components (must be done after inputs/outputs)
-	// Process certificates (may depend on stake addresses from outputs)
-	if certs := bp.getTransactionCertificates(transaction, blockType); len(certs) > 0 {
-		if err := bp.certificateProcessor.ProcessCertificates(ctx, tx, txHash, certs); err != nil {
-			unifiederrors.Get().Warning("BlockProcessor", "ProcessCertificates", fmt.Sprintf("Failed to process certificates: %v", err))
+	// Process wallet connections - track sender→receiver relationships
+	// This runs after inputs and outputs are processed so we can look up spent UTxO addresses
+	if bp.walletConnectionProcessor != nil {
+		if err := bp.walletConnectionProcessor.ProcessTransaction(tx, txHash, slotNo, transaction); err != nil {
+			unifiederrors.Get().Warning("BlockProcessor", "ProcessWalletConnections", fmt.Sprintf("Failed to process wallet connections: %v", err))
 		}
 	}
 
-	// Process governance actions (may depend on other components)
-	if bp.hasGovernanceData(transaction, blockType) {
-		if err := bp.governanceProcessor.ProcessTransaction(tx, txHash, transaction, blockType); err != nil {
-			unifiederrors.Get().Warning("BlockProcessor", "ProcessGovernance", fmt.Sprintf("Failed to process governance: %v", err))
+	return nil
+}
+
+// processFilteredMetadata processes only allowed metadata labels
+func (bp *BlockProcessor) processFilteredMetadata(ctx context.Context, tx *gorm.DB, txHash []byte, metadata *cbor.LazyValue) error {
+	// If no filter specified, process all metadata
+	if len(bp.config.MetadataLabels) == 0 {
+		return bp.metadataProcessor.ProcessMetadata(tx, txHash, metadata)
+	}
+
+	// Create allowlist map for fast lookup
+	allowedLabels := make(map[uint64]bool)
+	for _, label := range bp.config.MetadataLabels {
+		allowedLabels[label] = true
+	}
+
+	// Decode metadata
+	decodedValue := metadata.Value()
+	if decodedValue == nil {
+		decoded, err := metadata.Decode()
+		if err != nil {
+			return err
+		}
+		decodedValue = decoded
+	}
+
+	// Handle different metadata formats
+	var metadataMap map[uint64]interface{}
+	switch v := decodedValue.(type) {
+	case map[uint64]interface{}:
+		metadataMap = v
+	case map[interface{}]interface{}:
+		// Convert to map[uint64]interface{}
+		metadataMap = make(map[uint64]interface{})
+		for k, val := range v {
+			switch key := k.(type) {
+			case uint64:
+				metadataMap[key] = val
+			case int64:
+				metadataMap[uint64(key)] = val
+			case int:
+				metadataMap[uint64(key)] = val
+			}
+		}
+	default:
+		// Can't filter non-map metadata, process as-is
+		return bp.metadataProcessor.ProcessMetadata(tx, txHash, metadata)
+	}
+
+	// Process only allowed labels
+	for key, value := range metadataMap {
+		if !allowedLabels[key] {
+			// Skip this label - not in allowlist
+			continue
+		}
+
+		// Process this metadata entry
+		if err := bp.metadataProcessor.processMetadataEntry(tx, txHash, key, value); err != nil {
+			return fmt.Errorf("failed to process metadata label %d: %w", key, err)
 		}
 	}
 
@@ -492,31 +562,10 @@ func (bp *BlockProcessor) processTransactionBatch(ctx context.Context, tx *gorm.
 			}
 		}
 
-		// Process certificates
-		if certs := bp.getTransactionCertificates(transaction, blockType); len(certs) > 0 {
-			if err := bp.certificateProcessor.ProcessCertificates(ctx, tx, txHash, certs); err != nil {
-				unifiederrors.Get().Warning("BlockProcessor", "ProcessCertificates", fmt.Sprintf("Failed to process certificates: %v", err))
-			}
-		}
-
-		// Process withdrawals
-		if withdrawals := bp.getTransactionWithdrawals(transaction, blockType); len(withdrawals) > 0 {
-			if err := bp.withdrawalProcessor.ProcessWithdrawals(ctx, tx, txHash, withdrawals, blockType); err != nil {
-				unifiederrors.Get().Warning("BlockProcessor", "ProcessWithdrawals", fmt.Sprintf("Failed to process withdrawals: %v", err))
-			}
-		}
-
 		// Process minting/burning
 		if mint := bp.getTransactionMint(transaction, blockType); len(mint) > 0 {
 			if err := bp.assetProcessor.ProcessMint(tx, txHash, mint); err != nil {
 				unifiederrors.Get().Warning("BlockProcessor", "ProcessMint", fmt.Sprintf("Failed to process mint: %v", err))
-			}
-		}
-
-		// Process governance actions
-		if bp.hasGovernanceData(transaction, blockType) {
-			if err := bp.governanceProcessor.ProcessTransaction(tx, txHash, transaction, blockType); err != nil {
-				unifiederrors.Get().Warning("BlockProcessor", "ProcessGovernance", fmt.Sprintf("Failed to process governance: %v", err))
 			}
 		}
 
@@ -565,7 +614,7 @@ func (bp *BlockProcessor) processTransactionInputs(ctx context.Context, tx *gorm
 	err := database.RetryOperation(func() error {
 		return database.FastCreateInBatches(tx, inputBatch, bp.currentEraConfig.TxInBatchSize)
 	})
-	
+
 	if err != nil {
 		// If it's a duplicate key error, log and continue
 		if strings.Contains(err.Error(), "Duplicate entry") {
@@ -598,18 +647,18 @@ func (bp *BlockProcessor) processTransactionOutputs(ctx context.Context, tx *gor
 					// For problematic addresses, use base58 encoding of raw bytes as fallback
 					if addrBytes, err := address.Bytes(); err == nil {
 						addressStr = fmt.Sprintf("byron_raw_%x", addrBytes)
-						unifiederrors.Get().Warning("BlockProcessor", "AddressFormat", 
+						unifiederrors.Get().Warning("BlockProcessor", "AddressFormat",
 							fmt.Sprintf("Address.String() panicked, using raw format: %v", r))
 					} else {
 						addressStr = fmt.Sprintf("invalid_address_%d", i)
-						unifiederrors.Get().LogError(unifiederrors.ErrorTypeProcessing, "BlockProcessor", "GetAddress", 
+						unifiederrors.Get().LogError(unifiederrors.ErrorTypeProcessing, "BlockProcessor", "GetAddress",
 							fmt.Sprintf("Failed to get address string and bytes: %v", r))
 					}
 				}
 			}()
 			addressStr = address.String()
 		}()
-		
+
 		// Handle extremely long Byron addresses that exceed database column limit
 		// Some Byron addresses with derivation paths can be extremely long when converted to string
 		const maxAddressLength = 2048
@@ -629,7 +678,7 @@ func (bp *BlockProcessor) processTransactionOutputs(ctx context.Context, tx *gor
 				// Fallback: use index-based identifier
 				addressStr = fmt.Sprintf("byron_toolong_%d_%d", len(addressStr), i)
 			}
-			unifiederrors.Get().Warning("BlockProcessor", "AddressLength", 
+			unifiederrors.Get().Warning("BlockProcessor", "AddressLength",
 				fmt.Sprintf("Byron address too long (%d chars), using alternative representation: %s", len(address.String()), addressStr))
 		}
 
@@ -699,12 +748,12 @@ func (bp *BlockProcessor) processTransactionOutputs(ctx context.Context, tx *gor
 	err := database.RetryOperation(func() error {
 		return database.FastCreateInBatches(tx, outputBatch, batchSize)
 	})
-	
+
 	if err != nil {
 		// Debug: Log the addresses that are failing
 		for _, out := range outputBatch {
 			if len(out.Address) > 2048 {
-				unifiederrors.Get().LogError(unifiederrors.ErrorTypeValidation, "BlockProcessor", "AddressLength", 
+				unifiederrors.Get().LogError(unifiederrors.ErrorTypeValidation, "BlockProcessor", "AddressLength",
 					fmt.Sprintf("Address too long (%d chars): %s", len(out.Address), out.Address))
 			}
 		}
@@ -723,99 +772,13 @@ func (bp *BlockProcessor) processTransactionOutputs(ctx context.Context, tx *gor
 	return nil
 }
 
-// getOrCreateSlotLeader gets or creates a slot leader by hash
-func (bp *BlockProcessor) getOrCreateSlotLeader(tx *gorm.DB, block ledger.Block, blockType uint) ([]byte, error) {
-	// For Byron blocks, use a deterministic hash based on block data
-	if blockType == BlockTypeByronEBB || blockType == BlockTypeByronMain {
-		// Create a deterministic hash for Byron slot leader
-		hash := block.Header().Hash()
-		slotLeaderHash := hash[:28] // Use first 28 bytes of block hash
-		
-		// Check cache first
-		cacheKey := fmt.Sprintf("%x", slotLeaderHash)
-		cachedHash, exists := bp.slotLeaderCache.Get(cacheKey)
-		if exists {
-			return cachedHash, nil
-		}
-
-		// Check if exists in database using optimized query
-		var count int64
-		if err := tx.Model(&models.SlotLeader{}).Where("hash = ?", slotLeaderHash).Count(&count).Error; err != nil {
-			return nil, err
-		}
-		
-		if count == 0 {
-			// Create slot leader using fast insert
-			slotLeader := &models.SlotLeader{
-				Hash:        slotLeaderHash,
-				PoolHash:    nil,
-				Description: &[]string{"Byron slot leader"}[0],
-			}
-			if err := database.FastCreate(tx, slotLeader); err != nil {
-				return nil, err
-			}
-		}
-		
-		// Cache the result
-		bp.slotLeaderCache.Put(cacheKey, slotLeaderHash)
-		return slotLeaderHash, nil
-	}
-
-	// For Shelley+ blocks, extract issuer verification key
-	blockHeader := block.Header()
-	var issuerVkey []byte
-
-	switch header := blockHeader.(type) {
-	case *ledger.ShelleyBlockHeader:
-		issuerVkey = header.Body.IssuerVkey[:]
-	case *ledger.BabbageBlockHeader:
-		issuerVkey = header.Body.IssuerVkey[:]
-	default:
-		// Fallback to block hash
-		hash := blockHeader.Hash()
-		issuerVkey = hash[:28]
-	}
-
-	// Use first 28 bytes as slot leader hash
-	slotLeaderHash := issuerVkey[:28]
-	
-	// Check cache first
-	cacheKey := fmt.Sprintf("%x", slotLeaderHash)
-	cachedHash, exists := bp.slotLeaderCache.Get(cacheKey)
-	if exists {
-		return cachedHash, nil
-	}
-
-	// Check if exists in database using optimized query
-	var count int64
-	if err := tx.Model(&models.SlotLeader{}).Where("hash = ?", slotLeaderHash).Count(&count).Error; err != nil {
-		return nil, err
-	}
-	
-	if count == 0 {
-		// Create slot leader using fast insert
-		slotLeader := &models.SlotLeader{
-			Hash:        slotLeaderHash,
-			PoolHash:    nil,
-			Description: nil,
-		}
-		if err := database.FastCreate(tx, slotLeader); err != nil {
-			return nil, err
-		}
-	}
-	
-	// Cache the result
-	bp.slotLeaderCache.Put(cacheKey, slotLeaderHash)
-	return slotLeaderHash, nil
-}
-
 // Helper functions remain largely the same but work with hashes instead of IDs
 func (bp *BlockProcessor) getEpochForSlot(slot uint64, blockType uint) uint32 {
 	// Special handling for Byron-Shelley boundary
 	if slot == constants.ByronEraEndSlot+1 {
 		return 208
 	}
-	
+
 	switch blockType {
 	case BlockTypeByronEBB, BlockTypeByronMain:
 		return uint32(slot / 21600) // Byron epoch = 21600 slots
@@ -1051,13 +1014,6 @@ func (bp *BlockProcessor) processEpochBoundary(ctx context.Context, tx *gorm.DB,
 	// Log epoch transition
 	log.Printf("[INFO] Epoch boundary: entering epoch %d at slot %d", epochNo, *block.SlotNo)
 
-	// Calculate ADA pots for this epoch
-	if bp.adaPotsCalculator != nil && epochNo >= 208 { // Only for Shelley+
-		if err := bp.adaPotsCalculator.CalculateAdaPotsForEpoch(epochNo, *block.SlotNo); err != nil {
-			log.Printf("[WARNING] Failed to calculate ada_pots for epoch %d: %v", epochNo, err)
-		}
-	}
-
 	// Provide epoch parameters
 	if bp.epochParamsProvider != nil {
 		if err := bp.epochParamsProvider.ProvideEpochParams(epochNo); err != nil {
@@ -1070,11 +1026,11 @@ func (bp *BlockProcessor) processEpochBoundary(ctx context.Context, tx *gorm.DB,
 		// Calculate rewards for epoch N-2
 		rewardEpoch := epochNo - 2
 		log.Printf("[INFO] Calculating rewards for epoch %d (current epoch: %d)", rewardEpoch, epochNo)
-		
+
 		if err := bp.stateQueryService.CalculateEpochRewards(epochNo); err != nil {
 			log.Printf("[WARNING] Failed to calculate rewards for epoch %d: %v", rewardEpoch, err)
 		}
-		
+
 		// Process refunds for the current epoch
 		if err := bp.stateQueryService.ProcessRefunds(epochNo); err != nil {
 			log.Printf("[WARNING] Failed to process refunds for epoch %d: %v", epochNo, err)
@@ -1312,17 +1268,6 @@ func (bp *BlockProcessor) extractStakeAddress(addr ledger.Address) bool {
 	return true
 }
 
-// SetMetadataFetcher sets the metadata fetcher on the block processor
-func (bp *BlockProcessor) SetMetadataFetcher(fetcher MetadataFetcher) {
-	// Set the fetcher on our processors
-	if bp.certificateProcessor != nil {
-		bp.certificateProcessor.SetMetadataFetcher(fetcher)
-	}
-	if bp.governanceProcessor != nil {
-		bp.governanceProcessor.SetMetadataFetcher(fetcher)
-	}
-}
-
 // SetStateQueryService sets the state query service for reward calculation
 func (bp *BlockProcessor) SetStateQueryService(service StateQueryService) {
 	bp.stateQueryService = service
@@ -1346,11 +1291,11 @@ func isZeroHash(hash [32]byte) bool {
 func (bp *BlockProcessor) updateEraConfig(epochNo uint32) {
 	oldEra := GetEraName(bp.currentEpoch)
 	newEra := GetEraName(uint64(epochNo))
-	
+
 	// Update configuration
 	bp.currentEpoch = uint64(epochNo)
 	bp.currentEraConfig = GetEraConfig(uint64(epochNo))
-	
+
 	// Log era transition
 	if oldEra != newEra {
 		log.Printf("[ERA TRANSITION] Entering %s era at epoch %d", newEra, epochNo)
@@ -1427,7 +1372,7 @@ func (bp *BlockProcessor) processCollateralReturn(ctx context.Context, tx *gorm.
 		}()
 		addressStr = address.String()
 	}()
-	
+
 	// Handle extremely long Byron addresses that exceed database column limit
 	// Note: collateral_tx_outs table has VARCHAR(100) for address, much smaller than tx_outs
 	const maxCollateralAddressLength = 100
@@ -1442,7 +1387,7 @@ func (bp *BlockProcessor) processCollateralReturn(ctx context.Context, tx *gorm.
 			// Fallback: use truncated identifier
 			addressStr = fmt.Sprintf("byron_long_%d", len(addressStr))
 		}
-		unifiederrors.Get().Warning("BlockProcessor", "CollateralAddressLength", 
+		unifiederrors.Get().Warning("BlockProcessor", "CollateralAddressLength",
 			fmt.Sprintf("Collateral address too long (%d chars), using hash: %s", len(address.String()), addressStr))
 	}
 
@@ -1608,6 +1553,11 @@ func (bp *BlockProcessor) GetDB() *gorm.DB {
 
 // EnsureHealthyConnection ensures the database connection is healthy
 func (bp *BlockProcessor) EnsureHealthyConnection() error {
+	return bp.EnsureHealthyConnectionWithContext(context.Background())
+}
+
+// EnsureHealthyConnectionWithContext ensures the database connection is healthy with timeout support
+func (bp *BlockProcessor) EnsureHealthyConnectionWithContext(ctx context.Context) error {
 	var sqlDB *sql.DB
 	sqlDB, err := bp.db.DB()
 	if err != nil {
@@ -1617,22 +1567,22 @@ func (bp *BlockProcessor) EnsureHealthyConnection() error {
 	// Get connection pool stats
 	stats := sqlDB.Stats()
 	if stats.OpenConnections > 100 || stats.InUse > 50 {
-		log.Printf("[CONN] Connection pool stats: open=%d, in_use=%d, idle=%d, wait_count=%d, wait_duration=%v", 
+		log.Printf("[CONN] Connection pool stats: open=%d, in_use=%d, idle=%d, wait_count=%d, wait_duration=%v",
 			stats.OpenConnections, stats.InUse, stats.Idle, stats.WaitCount, stats.WaitDuration)
 	}
 
-	// Try a simple ping first
-	if err := sqlDB.Ping(); err != nil {
+	// Try a simple ping first with context for timeout support
+	if err := sqlDB.PingContext(ctx); err != nil {
 		// Connection is unhealthy, but DON'T close it here
 		// The ConnectionPoolManager should handle recovery
-		log.Printf("[ERROR] Connection ping failed: %v (open=%d, in_use=%d)", 
+		log.Printf("[ERROR] Connection ping failed: %v (open=%d, in_use=%d)",
 			err, stats.OpenConnections, stats.InUse)
 		return fmt.Errorf("connection ping failed: %w", err)
 	}
 
 	// Also check for any pending results that might cause "commands out of sync"
 	// This is a common issue when a previous query wasn't fully consumed
-	if err := bp.db.Exec("SELECT 1").Error; err != nil {
+	if err := bp.db.WithContext(ctx).Exec("SELECT 1").Error; err != nil {
 		if strings.Contains(err.Error(), "commands out of sync") {
 			// Try to clear the connection state
 			bp.db.Exec("DO 1") // Simple no-op to clear state

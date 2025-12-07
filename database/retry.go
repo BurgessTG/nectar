@@ -64,6 +64,13 @@ func IsRetryableError(err error) bool {
 		return true
 	}
 
+	// Context/transaction state errors - need fresh transaction
+	if strings.Contains(errStr, "already been committed or rolled back") ||
+		strings.Contains(errStr, "context canceled") ||
+		strings.Contains(errStr, "context deadline exceeded") {
+		return true
+	}
+
 	return false
 }
 

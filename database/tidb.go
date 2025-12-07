@@ -17,10 +17,11 @@ import (
 const (
 	// DefaultTiDBDSN is used only if TIDB_DSN environment variable is not set
 	// In production, always set TIDB_DSN with proper credentials
+	// Note: tx_isolation removed from DSN - set at session level to avoid mid-transaction conflicts
 	// Added interpolateParams=true to reduce round trips and improve performance
-	DefaultTiDBDSN = "root:@tcp(127.0.0.1:4000)/nectar?charset=utf8mb4&parseTime=True&loc=Local&timeout=300s&readTimeout=300s&writeTimeout=300s&maxAllowedPacket=67108864&autocommit=true&tx_isolation='READ-COMMITTED'&interpolateParams=true"
+	DefaultTiDBDSN = "root:@tcp(127.0.0.1:4000)/nectar?charset=utf8mb4&parseTime=True&loc=Local&timeout=60s&readTimeout=60s&writeTimeout=300s&maxAllowedPacket=67108864&autocommit=true&interpolateParams=true"
 	// Deprecated: Use NECTAR_DSN environment variable instead
-	NectarDBDSN = "root:@tcp(127.0.0.1:4000)/nectar?charset=utf8mb4&parseTime=True&loc=Local&timeout=300s&readTimeout=300s&writeTimeout=300s&maxAllowedPacket=67108864&autocommit=true&tx_isolation='READ-COMMITTED'&interpolateParams=true"
+	NectarDBDSN = "root:@tcp(127.0.0.1:4000)/nectar?charset=utf8mb4&parseTime=True&loc=Local&timeout=60s&readTimeout=60s&writeTimeout=300s&maxAllowedPacket=67108864&autocommit=true&interpolateParams=true"
 )
 
 // InitTiDB initializes the TiDB connection with optimizations
@@ -167,6 +168,10 @@ func applyTiDBOptimizations(db *gorm.DB) error {
 // enableTiDBOptimizations applies TiDB-specific session optimizations
 func enableTiDBOptimizations(db *gorm.DB) error {
 	optimizations := []string{
+		// CRITICAL: Set transaction isolation at session level (not per-transaction)
+		// This avoids "Transaction characteristics can't be changed while a transaction is in progress" errors
+		"SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+
 		// Batch operation optimizations
 		"SET SESSION tidb_batch_insert = ON",
 		"SET SESSION tidb_batch_delete = ON",
@@ -177,7 +182,7 @@ func enableTiDBOptimizations(db *gorm.DB) error {
 		// Skip unnecessary checks
 		"SET SESSION tidb_skip_utf8_check = ON",
 		"SET SESSION tidb_constraint_check_in_place = OFF",
-		
+
 		// Enable compression for new tables
 		"SET SESSION tidb_enable_table_partition = ON",
 		"SET SESSION tidb_row_format_version = 2",
