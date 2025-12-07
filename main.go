@@ -136,7 +136,7 @@ func NewSmartSocketDetector() *SmartSocketDetector {
 func (ssd *SmartSocketDetector) DetectCardanoSocket() (string, error) {
 	// Note: Can't use dashboard logging here as indexer doesn't exist yet
 	// These logs will be captured by DashboardLogWriter once it's set up
-	
+
 	var workingSocket string
 	var connectionErrors []string
 
@@ -170,6 +170,11 @@ func (ssd *SmartSocketDetector) DetectCardanoSocket() (string, error) {
 
 // socketExists checks if the socket file exists and is a socket
 func (ssd *SmartSocketDetector) socketExists(path string) bool {
+	// If it looks like a TCP address, assume it exists
+	if strings.Contains(path, ":") {
+		return true
+	}
+
 	info, err := os.Stat(path)
 	if err != nil {
 		return false
@@ -181,7 +186,12 @@ func (ssd *SmartSocketDetector) socketExists(path string) bool {
 
 // testConnectivity tests if we can actually connect to the socket
 func (ssd *SmartSocketDetector) testConnectivity(path string) bool {
-	conn, err := net.DialTimeout("unix", path, ssd.timeoutDuration)
+	network := "unix"
+	if strings.Contains(path, ":") {
+		network = "tcp"
+	}
+
+	conn, err := net.DialTimeout(network, path, ssd.timeoutDuration)
 	if err != nil {
 		return false
 	}
@@ -222,6 +232,7 @@ type ReferenceAlignedIndexer struct {
 	processorIndex  uint64 // For round-robin connection selection
 	ctx             context.Context
 	cancel          context.CancelFunc
+	config          *config.IndexingConfig // Selective indexing configuration
 
 	// SINGLE MULTIPLEXED CONNECTION - Reference Pattern
 	oConn     *ouroboros.Connection
@@ -233,7 +244,6 @@ type ReferenceAlignedIndexer struct {
 	isRunning         atomic.Bool
 
 	// Protocol mode tracking
-
 
 	// Enhanced monitoring
 	errorStats   *ErrorStatistics
@@ -257,15 +267,15 @@ type ReferenceAlignedIndexer struct {
 	stateQueryService *statequery.Service
 
 	// Dashboard interface - supports multiple dashboard types
-	dashboard dashboard.Dashboard
-	dashboardErrorChan chan struct{
+	dashboard          dashboard.Dashboard
+	dashboardErrorChan chan struct {
 		errorType string
 		message   string
 	}
-	
+
 	// Era tracking for dynamic configuration
-	currentEpoch      atomic.Uint64
-	currentEraConfig  *processors.EraConfig
+	currentEpoch     atomic.Uint64
+	currentEraConfig *processors.EraConfig
 
 	// Sync mode tracking
 	isBulkSync      atomic.Bool
@@ -276,6 +286,12 @@ type ReferenceAlignedIndexer struct {
 	blockWorkers  int
 	activeWorkers atomic.Int32
 	workerWg      sync.WaitGroup
+
+	// Connection watchdog for automatic reconnection
+	lastBlockReceived atomic.Pointer[time.Time]
+	reconnecting      atomic.Bool
+	reconnectChan     chan struct{}
+	socketPath        string // Store for reconnection
 }
 
 // blockQueueItem represents a block to be processed
@@ -320,30 +336,30 @@ func (rai *ReferenceAlignedIndexer) logToActivity(activityType, message string) 
 		log.Println(message)
 		return
 	}
-	
+
 	// Route to activity feed
 	rai.addActivityEntry(activityType, message, nil)
 }
 
 func (dlw *DashboardLogWriter) Write(p []byte) (n int, err error) {
 	logMsg := string(p)
-	
+
 	// Check if dashboard is running
 	if dlw.indexer == nil || !dlw.indexer.dashboardEnabled.Load() || !dlw.indexer.dashboardRunning.Load() {
 		// Dashboard not running - write everything to stdout
 		os.Stdout.Write(p)
 		return len(p), nil
 	}
-	
+
 	// Always show critical dashboard messages
-	if strings.Contains(logMsg, "[Web]") || 
-	   strings.Contains(logMsg, "[Dashboard]") ||
-	   strings.Contains(logMsg, "Dashboard server") ||
-	   strings.Contains(logMsg, "Dashboard started") ||
-	   strings.Contains(logMsg, "Web dashboard") {
+	if strings.Contains(logMsg, "[Web]") ||
+		strings.Contains(logMsg, "[Dashboard]") ||
+		strings.Contains(logMsg, "Dashboard server") ||
+		strings.Contains(logMsg, "Dashboard started") ||
+		strings.Contains(logMsg, "Web dashboard") {
 		os.Stdout.Write(p)
 	}
-	
+
 	// For terminal-only mode, suppress regular logs to keep display clean
 	// Only critical messages should appear
 	dashboardType := os.Getenv("DASHBOARD_TYPE")
@@ -464,43 +480,43 @@ func clearShelleyData(db *gorm.DB) error {
 		Pluck("hash", &shelleyBlockHashes).Error; err != nil {
 		return fmt.Errorf("failed to get Shelley block hashes: %w", err)
 	}
-	
+
 	if len(shelleyBlockHashes) == 0 {
 		// No Shelley blocks to clear
 		return nil
 	}
-	
+
 	// Found Shelley blocks to clear - will be logged when dashboard is ready
-	
+
 	// Delete all related data
-	tables := []struct{
-		model interface{}
+	tables := []struct {
+		model     interface{}
 		condition string
-		args []interface{}
+		args      []interface{}
 	}{
 		// Transaction outputs (with assets)
 		{&models.MultiAsset{}, "tx_out_id IN (SELECT id FROM tx_outs WHERE tx_hash IN (SELECT hash FROM txes WHERE block_hash IN (?)))", []interface{}{shelleyBlockHashes}},
 		{&models.TxOut{}, "tx_hash IN (SELECT hash FROM txes WHERE block_hash IN (?))", []interface{}{shelleyBlockHashes}},
-		
+
 		// Transaction inputs
 		{&models.TxIn{}, "tx_in_id IN (SELECT hash FROM txes WHERE block_hash IN (?))", []interface{}{shelleyBlockHashes}},
-		
+
 		// Staking operations
 		{&models.Delegation{}, "tx_hash IN (SELECT hash FROM txes WHERE block_hash IN (?))", []interface{}{shelleyBlockHashes}},
 		{&models.StakeRegistration{}, "tx_hash IN (SELECT hash FROM txes WHERE block_hash IN (?))", []interface{}{shelleyBlockHashes}},
 		{&models.StakeDeregistration{}, "tx_hash IN (SELECT hash FROM txes WHERE block_hash IN (?))", []interface{}{shelleyBlockHashes}},
 		{&models.Withdrawal{}, "tx_hash IN (SELECT hash FROM txes WHERE block_hash IN (?))", []interface{}{shelleyBlockHashes}},
-		
+
 		// Pool operations
 		{&models.PoolUpdate{}, "registered_tx_hash IN (SELECT hash FROM txes WHERE block_hash IN (?))", []interface{}{shelleyBlockHashes}},
 		{&models.PoolRetire{}, "announced_tx_hash IN (SELECT hash FROM txes WHERE block_hash IN (?))", []interface{}{shelleyBlockHashes}},
-		
+
 		// Metadata
 		{&models.TxMetadata{}, "tx_hash IN (SELECT hash FROM txes WHERE block_hash IN (?))", []interface{}{shelleyBlockHashes}},
-		
+
 		// Transactions
 		{&models.Tx{}, "block_hash IN (?)", []interface{}{shelleyBlockHashes}},
-		
+
 		// Finally blocks
 		{&models.Block{}, "hash IN (?)", []interface{}{shelleyBlockHashes}},
 	}
@@ -549,16 +565,16 @@ func rotateLogFiles() {
 		"errors.log",
 		"logs/nectar.log",
 	}
-	
+
 	const maxSize = 10 * 1024 * 1024 // 10MB max before rotation
-	
+
 	for _, logFile := range logFiles {
 		if info, err := os.Stat(logFile); err == nil {
 			if info.Size() > maxSize {
 				// Rotate the file
 				backupName := fmt.Sprintf("%s.%s.bak", logFile, time.Now().Format("20060102-150405"))
 				if err := os.Rename(logFile, backupName); err == nil {
-					log.Printf("[INFO] Rotated large log file: %s (%.1f MB) -> %s", 
+					log.Printf("[INFO] Rotated large log file: %s (%.1f MB) -> %s",
 						logFile, float64(info.Size())/(1024*1024), backupName)
 				}
 			}
@@ -595,7 +611,7 @@ func main() {
 	flag.StringVar(&configPath, "config", "nectar.toml", "Path to configuration file")
 	flag.StringVar(&configPath, "c", "nectar.toml", "Path to configuration file (shorthand)")
 	flag.Parse()
-	
+
 	log.Println("Nectar.")
 	log.Println("   High-performance Cardano indexer")
 
@@ -617,13 +633,13 @@ func main() {
 
 	// Get active performance configuration (start with epoch 0, will update dynamically)
 	activeConfig := cfg.Performance.GetActiveConfig(0)
-	
+
 	// Log system limits
 	log.Printf("[CONFIG] System limits: max_workers=%d, max_connections=%d, max_batch=%d, max_queue=%d",
-		cfg.Performance.MaxWorkers, cfg.Performance.MaxConnections, 
+		cfg.Performance.MaxWorkers, cfg.Performance.MaxConnections,
 		cfg.Performance.MaxBatchSize, cfg.Performance.MaxQueueSize)
 	log.Printf("[CONFIG] Optimization mode: %s", cfg.Performance.OptimizationMode)
-	
+
 	// Log active configuration
 	log.Printf("[CONFIG] Active configuration (%s):", activeConfig.Source)
 	log.Printf("[CONFIG]   Workers: %d", activeConfig.Workers)
@@ -631,7 +647,22 @@ func main() {
 	log.Printf("[CONFIG]   Batch size: %d", activeConfig.BatchSize)
 	log.Printf("[CONFIG]   Queue size: %d", activeConfig.QueueSize)
 	log.Printf("[CONFIG]   Fetch range: %d", activeConfig.FetchRange)
-	
+
+	// Log indexing configuration (selective indexing)
+	log.Printf("[CONFIG] Indexing configuration:")
+	log.Printf("[CONFIG]   Core: transactions=%t, blocks=%t", cfg.Indexing.Transactions, cfg.Indexing.Blocks)
+	log.Printf("[CONFIG]   Token features: metadata=%t, assets=%t, minting=%t",
+		cfg.Indexing.Metadata, cfg.Indexing.Assets, cfg.Indexing.Minting)
+	log.Printf("[CONFIG]   UTxO data: utxos=%t, inputs=%t, outputs=%t",
+		cfg.Indexing.UTXOs, cfg.Indexing.Inputs, cfg.Indexing.Outputs)
+	log.Printf("[CONFIG]   Other: scripts=%t, collateral=%t",
+		cfg.Indexing.Scripts, cfg.Indexing.Collateral)
+	if len(cfg.Indexing.MetadataLabels) > 0 {
+		log.Printf("[CONFIG]   Metadata labels filter: %v (only these labels will be indexed)", cfg.Indexing.MetadataLabels)
+	} else {
+		log.Printf("[CONFIG]   Metadata labels filter: none (all labels will be indexed)")
+	}
+
 	// Apply active configuration to global variables
 	DB_CONNECTION_POOL = activeConfig.Connections / activeConfig.Workers
 	WORKER_COUNT = activeConfig.Workers
@@ -639,24 +670,24 @@ func main() {
 	BULK_FETCH_RANGE_SIZE = activeConfig.FetchRange
 	BULK_MODE_ENABLED = cfg.Performance.BulkModeEnabled
 	DefaultCardanoNodeSocket = cfg.Cardano.NodeSocket
-	
+
 	// Also set environment variables for backward compatibility
 	if cfg.Database.DSN != "" {
 		os.Setenv("TIDB_DSN", cfg.Database.DSN)
 		os.Setenv("NECTAR_DSN", cfg.Database.DSN)
 	}
-	
+
 	if !cfg.Dashboard.Enabled {
 		os.Setenv("NECTAR_NO_DASHBOARD", "true")
 	}
 	os.Setenv("DASHBOARD_TYPE", cfg.Dashboard.Type)
 	os.Setenv("WEB_PORT", fmt.Sprintf("%d", cfg.Dashboard.WebPort))
-	
+
 	// Set network magic
 	if cfg.Cardano.NetworkMagic > 0 {
 		os.Setenv("CARDANO_NETWORK_MAGIC", fmt.Sprintf("%d", cfg.Cardano.NetworkMagic))
 	}
-	
+
 	// Set monitoring settings
 	if cfg.Monitoring.LogLevel != "" {
 		os.Setenv("LOG_LEVEL", cfg.Monitoring.LogLevel)
@@ -682,7 +713,7 @@ func main() {
 
 	// Initialize unified error system early (dashboard callback will be set later)
 	errors.Initialize(nil)
-	
+
 	// Clear accumulated errors from previous runs
 	errors.Get().ClearErrors()
 
@@ -693,9 +724,9 @@ func main() {
 	processors.InitLoggingConfig(false)
 
 	// CRITICAL FIX: Buffer all initialization logs to prevent dashboard corruption
-	var initLogBuffer strings.Builder
+	// var initLogBuffer strings.Builder
 	originalOutput := log.Writer()
-	log.SetOutput(&initLogBuffer)
+	// log.SetOutput(&initLogBuffer)
 
 	if os.Getenv("SKIP_MIGRATIONS") != "true" {
 		log.Println("Running database migrations...")
@@ -745,13 +776,13 @@ func main() {
 	log.SetFlags(log.LstdFlags) // Keep timestamps for parsing
 
 	// Process buffered initialization logs through the dashboard writer
-	if initLogs := initLogBuffer.String(); initLogs != "" {
-		for _, line := range strings.Split(strings.TrimSpace(initLogs), "\n") {
-			if line != "" {
-				dashboardWriter.Write([]byte(line + "\n"))
-			}
-		}
-	}
+	// if initLogs := initLogBuffer.String(); initLogs != "" {
+	// 	for _, line := range strings.Split(strings.TrimSpace(initLogs), "\n") {
+	// 		if line != "" {
+	// 			dashboardWriter.Write([]byte(line + "\n"))
+	// 		}
+	// 	}
+	// }
 
 	// Note: stderr interception is now handled by the MySQL logger setup
 	// which routes MySQL errors through the unified error system
@@ -759,7 +790,7 @@ func main() {
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	
+
 	// Start the indexer in a goroutine
 	errChan := make(chan error, 1)
 	go func() {
@@ -767,10 +798,12 @@ func main() {
 			errChan <- err
 		}
 	}()
-	
+
 	// Wait for either an error or a shutdown signal
 	select {
 	case err := <-errChan:
+		// Print to both stdout and log (in case log is redirected)
+		fmt.Fprintf(os.Stdout, "FATAL: Failed to start indexer: %v\n", err)
 		log.Fatalf("Failed to start indexer: %v", err)
 	case sig := <-sigChan:
 		log.Printf("Received signal %v, shutting down gracefully...", sig)
@@ -791,6 +824,7 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 	indexer := &ReferenceAlignedIndexer{
 		ctx:    ctx,
 		cancel: cancel,
+		config: &cfg.Indexing, // Store indexing config for later use
 
 		// Initialize performance stats
 		stats: &PerformanceStats{
@@ -809,7 +843,7 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 		},
 
 		// Parallel processing happens at transaction level, not block level
-		
+
 		// Initialize era configuration
 		currentEraConfig: processors.GetEraConfig(0), // Start with Byron
 	}
@@ -820,14 +854,14 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 		log.Println("[INFO] Dashboard disabled by environment")
 	} else {
 		indexer.dashboardEnabled.Store(true)
-		
+
 		// Initialize dashboard using factory
 		log.Println("[INFO] Creating dashboard...")
 		var dashboardErr error
 		indexer.dashboard, dashboardErr = dashboard.CreateDashboardWithAuth(
-			cfg.Auth.Enabled, 
-			cfg.Auth.Username, 
-			cfg.Auth.Password, 
+			cfg.Auth.Enabled,
+			cfg.Auth.Username,
+			cfg.Auth.Password,
 			cfg.Auth.Secret,
 		)
 		if dashboardErr != nil {
@@ -844,11 +878,11 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 	// Connect unified error system to dashboard
 	// Set up unified error system callback - errors will appear in ERROR MONITOR section
 	// Create a buffered channel for dashboard errors to prevent blocking
-	indexer.dashboardErrorChan = make(chan struct{
+	indexer.dashboardErrorChan = make(chan struct {
 		errorType string
 		message   string
 	}, 1000)
-	
+
 	// Start a goroutine to process dashboard errors sequentially
 	go func() {
 		for {
@@ -861,31 +895,31 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 				}
 				// Forward the actual error to the dashboard
 				if indexer.dashboard != nil {
-				// Parse the message to extract component and operation if possible
-				parts := strings.SplitN(err.message, ":", 2)
-				component := "System"
-				message := err.message
-				
-				if len(parts) == 2 && strings.Contains(parts[0], ".") {
-					// Format is "Component.Operation: message"
-					compOpParts := strings.SplitN(parts[0], ".", 2)
-					if len(compOpParts) == 2 {
-						component = compOpParts[0]
-						message = compOpParts[1] + ": " + parts[1]
+					// Parse the message to extract component and operation if possible
+					parts := strings.SplitN(err.message, ":", 2)
+					component := "System"
+					message := err.message
+
+					if len(parts) == 2 && strings.Contains(parts[0], ".") {
+						// Format is "Component.Operation: message"
+						compOpParts := strings.SplitN(parts[0], ".", 2)
+						if len(compOpParts) == 2 {
+							component = compOpParts[0]
+							message = compOpParts[1] + ": " + parts[1]
+						}
 					}
-				}
-				
+
 					// Forward to dashboard with proper type
 					indexer.dashboard.AddError(err.errorType, component, message)
 				}
 			}
 		}
 	}()
-	
+
 	errors.Get().SetDashboardCallback(func(errorType, message string) {
 		// Non-blocking send to channel
 		select {
-		case indexer.dashboardErrorChan <- struct{
+		case indexer.dashboardErrorChan <- struct {
 			errorType string
 			message   string
 		}{errorType, message}:
@@ -899,22 +933,22 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 	// Create connection pool manager with dedicated connections for each worker
 	poolConfig := database.GetDefaultConnectionPoolConfig()
 	poolConfig.WorkerCount = WORKER_COUNT
-	
+
 	connPoolManager, err := database.NewConnectionPoolManager(poolConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create connection pool manager: %w", err)
 	}
-	
+
 	// Store the connection pool manager
 	indexer.connPoolManager = connPoolManager
-	
+
 	// Create block processors with dedicated connections
 	for i := 0; i < WORKER_COUNT; i++ {
 		dbConn, err := connPoolManager.GetConnection(i)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get connection for worker %d: %w", i, err)
 		}
-		processor := processors.NewBlockProcessor(dbConn)
+		processor := processors.NewBlockProcessor(dbConn, &cfg.Indexing)
 		indexer.dbConnections = append(indexer.dbConnections, processor)
 	}
 
@@ -930,9 +964,9 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 			// Will be captured by log buffer
 
 			// Set metadata fetcher on all block processors
-			for _, processor := range indexer.dbConnections {
-				processor.SetMetadataFetcher(indexer.metadataFetcher)
-			}
+			// for _, processor := range indexer.dbConnections {
+			// 	processor.SetMetadataFetcher(indexer.metadataFetcher)
+			// }
 		}
 	}
 
@@ -950,7 +984,7 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 			}
 			indexer.stateQueryService = statequery.New(stateQueryDB, stateQueryConfig)
 			// Will be captured by log buffer
-			
+
 			// Set state query service on all block processors for reward calculation
 			for _, processor := range indexer.dbConnections {
 				processor.SetStateQueryService(indexer.stateQueryService)
@@ -983,29 +1017,42 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 func (rai *ReferenceAlignedIndexer) Start() error {
 	rai.logToActivity("system", "Creating REFERENCE-ALIGNED ouroboros connection...")
 
+	// Initialize reconnection channel
+	rai.reconnectChan = make(chan struct{}, 1)
+
 	if err := rai.createReferenceConnectionWithBlockFetch(); err != nil {
 		return fmt.Errorf("failed to create connection: %w", err)
 	}
 
+	// Start connection watchdog for automatic reconnection
+	rai.logToActivity("system", "Starting connection watchdog for automatic reconnection...")
+	rai.startConnectionWatchdog()
+
 	// Initialize block count and slot from database for accurate dashboard display
+	// Using optimized queries for TiDB: approximate counts from information_schema
+	// and ORDER BY LIMIT 1 instead of MAX() for faster index scans
 	if len(rai.dbConnections) > 0 {
 		var existingBlockCount int64
 		var maxSlot sql.NullInt64
 
-		// Get existing block count
-		err := rai.dbConnections[0].GetDB().Model(&models.Block{}).Count(&existingBlockCount).Error
+		// Get existing block count using TiDB's table statistics (fast, ~10ms vs 2-3s)
+		err := rai.dbConnections[0].GetDB().Raw(
+			"SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = 'nectar' AND table_name = 'blocks'",
+		).Scan(&existingBlockCount).Error
 		if err == nil && existingBlockCount > 0 {
 			atomic.StoreInt64(&rai.stats.blocksProcessed, existingBlockCount)
 			rai.stats.mutex.Lock()
 			rai.stats.lastBlockCount = existingBlockCount
 			rai.stats.cachedBlockCount = existingBlockCount
 			rai.stats.mutex.Unlock()
-			rai.logToActivity("system", fmt.Sprintf("Initialized dashboard with %d existing blocks from database", existingBlockCount))
+			rai.logToActivity("system", fmt.Sprintf("Initialized dashboard with ~%d existing blocks from database", existingBlockCount))
 		}
 
-		// Get the highest slot number
+		// Get the highest slot number using ORDER BY LIMIT 1 (uses descending index directly)
 		err = rai.dbConnections[0].GetDB().Model(&models.Block{}).
-			Select("MAX(slot_no)").
+			Select("slot_no").
+			Order("slot_no DESC").
+			Limit(1).
 			Scan(&maxSlot).Error
 		if err == nil && maxSlot.Valid {
 			rai.lastProcessedSlot.Store(uint64(maxSlot.Int64))
@@ -1015,9 +1062,11 @@ func (rai *ReferenceAlignedIndexer) Start() error {
 			rai.logToActivity("system", fmt.Sprintf("Initialized dashboard at slot %d", maxSlot.Int64))
 		}
 
-		// Also get transaction count for complete dashboard initialization
+		// Get transaction count using TiDB's table statistics (fast)
 		var txCount int64
-		err = rai.dbConnections[0].GetDB().Model(&models.Tx{}).Count(&txCount).Error
+		err = rai.dbConnections[0].GetDB().Raw(
+			"SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = 'nectar' AND table_name = 'txes'",
+		).Scan(&txCount).Error
 		if err == nil && txCount > 0 {
 			atomic.StoreInt64(&rai.stats.transactionsProcessed, txCount)
 			rai.stats.mutex.Lock()
@@ -1042,29 +1091,57 @@ func (rai *ReferenceAlignedIndexer) Start() error {
 	// Delay start to avoid conflicts during Byron sync
 	if rai.stateQueryService != nil {
 		go func() {
-			// Wait a bit to let sync establish what era we're in
-			select {
-			case <-rai.ctx.Done():
-				return
-			case <-time.After(30 * time.Second):
-			}
+			// StateQuery connects to live chain tip - useless during historical sync
+			// Wait until we're within 1 hour (3600 slots) of the estimated tip
+			const checkInterval = 5 * time.Minute
+			const slotsPerSecond = 1 // Shelley onwards
+			const shelleyStartSlot = uint64(4492800)
+			const shelleyStartTime = int64(1596059091) // July 29, 2020 21:44:51 UTC
+			const maxSlotsBehind = uint64(3600)        // ~1 hour behind tip
 
-			// Check if we're still in Byron
-			var currentSlot uint64
-			if len(rai.dbConnections) > 0 {
-				rai.dbConnections[0].GetDB().Model(&models.Block{}).Select("MAX(slot_no)").Scan(&currentSlot)
-			}
+			ticker := time.NewTicker(checkInterval)
+			defer ticker.Stop()
 
-			if currentSlot <= constants.ByronEraEndSlot {
-				rai.logToActivity("system", "Delaying state query service start until after Byron era")
-				return
-			}
+			for {
+				select {
+				case <-rai.ctx.Done():
+					return
+				case <-ticker.C:
+					// Get our current synced slot
+					var currentSlot uint64
+					if len(rai.dbConnections) > 0 {
+						rai.dbConnections[0].GetDB().Model(&models.Block{}).
+							Select("slot_no").
+							Order("slot_no DESC").
+							Limit(1).
+							Scan(&currentSlot)
+					}
 
-			if err := rai.stateQueryService.Start(); err != nil {
-				errors.Get().ProcessingError("StateQuery", "Start", fmt.Errorf("failed to start state query service: %w", err))
-				// Continue without state queries - it's not critical
-			} else {
-				rai.logToActivity("system", "Started state query service for rewards and ledger state data")
+					// Skip if still in Byron era
+					if currentSlot <= constants.ByronEraEndSlot {
+						continue
+					}
+
+					// Estimate current chain tip slot based on time
+					now := time.Now().Unix()
+					estimatedTipSlot := shelleyStartSlot + uint64(now-shelleyStartTime)*slotsPerSecond
+
+					// Check if we're close enough to the tip
+					if currentSlot+maxSlotsBehind >= estimatedTipSlot {
+						rai.logToActivity("system", fmt.Sprintf("Sync caught up (slot %d, tip ~%d), starting state query service", currentSlot, estimatedTipSlot))
+
+						if err := rai.stateQueryService.Start(); err != nil {
+							errors.Get().ProcessingError("StateQuery", "Start", fmt.Errorf("failed to start state query service: %w", err))
+						} else {
+							rai.logToActivity("system", "Started state query service for rewards and ledger state data")
+						}
+						return // Exit goroutine - service started
+					}
+
+					// Log progress periodically
+					slotsBehind := estimatedTipSlot - currentSlot
+					rai.logToActivity("system", fmt.Sprintf("StateQuery waiting: %d slots behind tip (need <%d)", slotsBehind, maxSlotsBehind))
+				}
 			}
 		}()
 	}
@@ -1079,17 +1156,17 @@ func (rai *ReferenceAlignedIndexer) Start() error {
 			log.Printf("[ERROR] Dashboard failed to start: %v", err)
 		} else {
 			log.Println("[INFO] Dashboard started successfully")
-			
+
 			// Give dashboard time to fully initialize
 			log.Println("[INFO] Waiting for dashboard to stabilize...")
 			time.Sleep(3 * time.Second)
-			
+
 			// NOW mark as running after it's stable
 			rai.dashboardRunning.Store(true)
-			
+
 			// Start the dashboard update loop
 			go rai.dashboardUpdateLoop()
-			
+
 			// Print dashboard access info
 			if os.Getenv("DASHBOARD_TYPE") == "web" || os.Getenv("DASHBOARD_TYPE") == "both" {
 				port := os.Getenv("WEB_PORT")
@@ -1106,7 +1183,7 @@ func (rai *ReferenceAlignedIndexer) Start() error {
 
 	// Initialize block queue and workers for async processing
 	// Use 8 workers to balance with TiDB cluster resource usage
-	rai.blockWorkers = 8
+	rai.blockWorkers = WORKER_COUNT
 	// Larger queue to reduce backpressure frequency
 	rai.blockQueue = make(chan blockQueueItem, 10000)
 	rai.logToActivity("system", fmt.Sprintf("Initializing %d block processing workers with queue capacity %d", rai.blockWorkers, 10000))
@@ -1185,6 +1262,8 @@ func (rai *ReferenceAlignedIndexer) createReferenceConnectionWithBlockFetch() er
 		return fmt.Errorf("failed to detect Cardano node socket: %w", err)
 	}
 
+	// Store socket path for reconnection
+	rai.socketPath = socketPath
 	rai.logToActivity("system", fmt.Sprintf("Creating Node-to-Client connection at: %s", socketPath))
 
 	// Create ChainSync config for Node-to-Client mode
@@ -1206,8 +1285,8 @@ func (rai *ReferenceAlignedIndexer) createReferenceConnectionWithBlockFetch() er
 
 	// Node-to-Client mode established
 
-	// Start error handler with filtering
-	connection.StartErrorHandler(rai.ctx, result.ErrorChannel, rai.addErrorEntry)
+	// Start error handler with reconnection support
+	connection.StartErrorHandler(rai.ctx, result.ErrorChannel, rai.handleConnectionError)
 
 	return nil
 }
@@ -1221,8 +1300,6 @@ func (rai *ReferenceAlignedIndexer) buildChainSyncConfig() chainsync.Config {
 		chainsync.WithBlockTimeout(10*time.Second),
 	)
 }
-
-
 
 // Reference-style handlers
 func (rai *ReferenceAlignedIndexer) chainSyncRollBackwardHandler(
@@ -1309,12 +1386,16 @@ func (rai *ReferenceAlignedIndexer) chainSyncRollForwardHandler(
 	blockData any,
 	tip chainsync.Tip,
 ) error {
+	// Update last block received time for connection watchdog
+	now := time.Now()
+	rai.lastBlockReceived.Store(&now)
+
 	// In Node-to-Client mode, ChainSync always delivers full blocks
 	block, ok := blockData.(ledger.Block)
 	if !ok {
 		return fmt.Errorf("invalid block data type: %T (expected ledger.Block)", blockData)
 	}
-	
+
 	if processors.GlobalLoggingConfig.LogBlockProcessing.Load() {
 		rai.logToActivity("block", fmt.Sprintf("Processing block at slot %d (type %d)", block.SlotNumber(), blockType))
 	}
@@ -1343,17 +1424,15 @@ func (rai *ReferenceAlignedIndexer) chainSyncRollForwardHandler(
 			retries:   0,
 		}:
 			return nil
-		case <-time.After(5 * time.Second):
-			// This is bad - workers are too slow
-			errors.Get().ProcessingError("Block", "Process", fmt.Errorf("workers cannot keep up, queue full for 5 seconds"))
-			return fmt.Errorf("workers cannot keep up, queue full for 5 seconds")
+		case <-time.After(30 * time.Second):
+			// This is bad - workers are too slow (increased from 5s to 30s for better recovery)
+			errors.Get().ProcessingError("Block", "Process", fmt.Errorf("workers cannot keep up, queue full for 30 seconds"))
+			return fmt.Errorf("workers cannot keep up, queue full for 30 seconds")
 		case <-rai.ctx.Done():
 			return fmt.Errorf("context cancelled")
 		}
 	}
 }
-
-
 
 // updateSequentialStats - Update performance statistics for sequential processing
 func (rai *ReferenceAlignedIndexer) updateSequentialStats(block ledger.Block) {
@@ -1384,7 +1463,7 @@ func (rai *ReferenceAlignedIndexer) blockWorker(id int) {
 	// Each worker gets its own dedicated connection to avoid "commands out of sync" errors
 	// This ensures no connection sharing between concurrent workers
 	if id >= len(rai.dbConnections) {
-		errors.Get().ProcessingError("Worker", fmt.Sprintf("Worker%d", id), 
+		errors.Get().ProcessingError("Worker", fmt.Sprintf("Worker%d", id),
 			fmt.Errorf("no dedicated connection available (only %d connections)", len(rai.dbConnections)))
 		return
 	}
@@ -1402,11 +1481,13 @@ func (rai *ReferenceAlignedIndexer) blockWorker(id int) {
 			maxRetries := 3
 			retryDelay := 100 * time.Millisecond
 			var err error
-			
+
 			for attempt := 0; attempt <= maxRetries; attempt++ {
-				// Ensure connection is healthy before processing
-				if connErr := processor.EnsureHealthyConnection(); connErr != nil {
-					errors.Get().DatabaseError("Worker", fmt.Sprintf("Worker%d.HealthCheck", id), 
+				// Ensure connection is healthy before processing (with timeout)
+				healthCtx, healthCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if connErr := processor.EnsureHealthyConnectionWithContext(healthCtx); connErr != nil {
+					healthCancel()
+					errors.Get().DatabaseError("Worker", fmt.Sprintf("Worker%d.HealthCheck", id),
 						fmt.Errorf("connection health check failed: %w", connErr))
 					// Try to recover the connection through the pool manager
 					if rai.connPoolManager != nil {
@@ -1417,10 +1498,10 @@ func (rai *ReferenceAlignedIndexer) blockWorker(id int) {
 							// Get the new connection and update the processor
 							if newConn, connErr := rai.connPoolManager.GetConnection(id); connErr == nil {
 								// Create new processor with the recovered connection
-								newProcessor := processors.NewBlockProcessor(newConn)
+								newProcessor := processors.NewBlockProcessor(newConn, rai.config)
 								// Copy metadata fetcher if it exists
 								if rai.metadataFetcher != nil {
-									newProcessor.SetMetadataFetcher(rai.metadataFetcher)
+									// newProcessor.SetMetadataFetcher(rai.metadataFetcher)
 								}
 								// Update both local and shared references
 								processor = newProcessor
@@ -1430,34 +1511,58 @@ func (rai *ReferenceAlignedIndexer) blockWorker(id int) {
 						}
 					}
 				}
-				
-				err = processor.ProcessBlock(rai.ctx, item.block, item.blockType)
+				healthCancel()
+
+				// Process block with 60-second timeout to prevent hung workers
+				processCtx, processCancel := context.WithTimeout(rai.ctx, 60*time.Second)
+				err = processor.ProcessBlock(processCtx, item.block, item.blockType)
+				processCancel()
 				if err == nil {
 					// Success - update stats
 					rai.updateSequentialStats(item.block)
 					rai.lastProcessedSlot.Store(item.block.SlotNumber())
 					break
 				}
-				
+
+				// Check if it's a timeout - recover connection and retry
+				if err == context.DeadlineExceeded || strings.Contains(err.Error(), "context deadline exceeded") {
+					errors.Get().ProcessingError("Worker", fmt.Sprintf("Worker%d.Timeout", id),
+						fmt.Errorf("block %d timed out (attempt %d/%d)", item.block.SlotNumber(), attempt+1, maxRetries+1))
+					// Force connection recovery after timeout
+					if rai.connPoolManager != nil {
+						if recoverErr := rai.connPoolManager.RecoverConnection(id); recoverErr == nil {
+							if newConn, connErr := rai.connPoolManager.GetConnection(id); connErr == nil {
+								processor = processors.NewBlockProcessor(newConn, rai.config)
+								rai.dbConnections[id] = processor
+								rai.logToActivity("system", fmt.Sprintf("Worker %d: connection recovered after timeout", id))
+							}
+						}
+					}
+					time.Sleep(retryDelay)
+					retryDelay *= 2
+					continue
+				}
+
 				// Check if it's a connection error that might be recoverable
 				errStr := err.Error()
-				if strings.Contains(errStr, "commands out of sync") || 
-				   strings.Contains(errStr, "bad connection") ||
-				   strings.Contains(errStr, "invalid connection") ||
-				   strings.Contains(errStr, "broken pipe") {
+				if strings.Contains(errStr, "commands out of sync") ||
+					strings.Contains(errStr, "bad connection") ||
+					strings.Contains(errStr, "invalid connection") ||
+					strings.Contains(errStr, "broken pipe") ||
+					strings.Contains(errStr, "context canceled") {
 					if attempt < maxRetries {
 						errors.Get().DatabaseError("Worker", fmt.Sprintf("Worker%d.Retry", id),
-							fmt.Errorf("connection error at slot %d (attempt %d/%d): %w", 
+							fmt.Errorf("connection error at slot %d (attempt %d/%d): %w",
 								item.block.SlotNumber(), attempt+1, maxRetries+1, err))
 						time.Sleep(retryDelay)
 						retryDelay *= 2 // Exponential backoff
-						
+
 						// Try to recover connection through pool manager
 						if rai.connPoolManager != nil {
 							if recoverErr := rai.connPoolManager.RecoverConnection(id); recoverErr == nil {
 								// Get the new connection and update the processor
 								if newConn, connErr := rai.connPoolManager.GetConnection(id); connErr == nil {
-									processor = processors.NewBlockProcessor(newConn)
+									processor = processors.NewBlockProcessor(newConn, rai.config)
 									rai.dbConnections[id] = processor
 								}
 							}
@@ -1465,7 +1570,7 @@ func (rai *ReferenceAlignedIndexer) blockWorker(id int) {
 						continue
 					}
 				}
-				
+
 				// For duplicate key errors, it's already processed - not an error
 				if strings.Contains(errStr, "Duplicate entry") {
 					// Don't log - duplicate keys are normal during parallel processing
@@ -1474,31 +1579,31 @@ func (rai *ReferenceAlignedIndexer) blockWorker(id int) {
 					rai.lastProcessedSlot.Store(item.block.SlotNumber())
 					break
 				}
-				
+
 				// Non-recoverable error or max retries reached
 				slotNum := item.block.SlotNumber()
 				errors.Get().ProcessingError("BlockWorker", fmt.Sprintf("Worker%d", id),
 					fmt.Errorf("failed to process block at slot %d after %d attempts: %w", slotNum, attempt+1, err))
-				
+
 				// Special handling for Byron-Shelley boundary errors
 				if slotNum >= 4492800 && slotNum <= 4493000 {
 					errors.Get().ProcessingError("BlockWorker", fmt.Sprintf("Worker%d.ByronShelley", id),
 						fmt.Errorf("error at boundary slot %d: %w", slotNum, err))
-					
+
 					// If this is Worker 4 and slot 4492900, add extra debugging
 					if id == 4 && slotNum == 4492900 {
 						errors.Get().ProcessingError("BlockWorker", "Worker4.Critical",
 							fmt.Errorf("Worker 4 failed at slot 4492900 again: %w", err))
-						
+
 						// Force connection recovery for Worker 4
 						rai.logToActivity("system", fmt.Sprintf("Forcing connection recovery for Worker %d", id))
 						if rai.connPoolManager != nil {
 							if recoverErr := rai.connPoolManager.RecoverConnection(id); recoverErr == nil {
 								if newConn, connErr := rai.connPoolManager.GetConnection(id); connErr == nil {
-									processor = processors.NewBlockProcessor(newConn)
+									processor = processors.NewBlockProcessor(newConn, rai.config)
 									rai.dbConnections[id] = processor
 									rai.logToActivity("system", fmt.Sprintf("Worker %d connection recovered, retrying block", id))
-									
+
 									// One more retry with fresh connection
 									time.Sleep(500 * time.Millisecond)
 									if retryErr := processor.ProcessBlock(rai.ctx, item.block, item.blockType); retryErr == nil {
@@ -1512,7 +1617,7 @@ func (rai *ReferenceAlignedIndexer) blockWorker(id int) {
 						}
 					}
 				}
-				
+
 				errors.Get().ProcessingError("BlockWorker", fmt.Sprintf("Worker%d", id),
 					fmt.Errorf("slot %d: %w", slotNum, err))
 				break
@@ -1535,6 +1640,16 @@ func (rai *ReferenceAlignedIndexer) startReferenceChainSync() error {
 		return fmt.Errorf("failed to build intersection points: %w", err)
 	}
 
+	// DEBUG: Print intersection points to stdout (bypass dashboard logging)
+	fmt.Fprintf(os.Stdout, "[DEBUG] Requesting intersection with %d point(s):\n", len(startPoints))
+	for i, point := range startPoints {
+		if point.Slot == 0 && len(point.Hash) == 0 {
+			fmt.Fprintf(os.Stdout, "[DEBUG]   Point %d: GENESIS (origin)\n", i)
+		} else {
+			fmt.Fprintf(os.Stdout, "[DEBUG]   Point %d: Slot=%d, Hash=%x\n", i, point.Slot, point.Hash)
+		}
+	}
+
 	rai.connMutex.RLock()
 	conn := rai.oConn
 	rai.connMutex.RUnlock()
@@ -1544,6 +1659,7 @@ func (rai *ReferenceAlignedIndexer) startReferenceChainSync() error {
 	}
 
 	if err := conn.ChainSync().Client.Sync(startPoints); err != nil {
+		fmt.Fprintf(os.Stdout, "[DEBUG] ChainSync.Sync() failed with error: %v\n", err)
 		return fmt.Errorf("failed to start ChainSync: %w", err)
 	}
 
@@ -1572,7 +1688,7 @@ func (rai *ReferenceAlignedIndexer) startPerformanceMonitoring() {
 			}
 		}
 	}()
-	
+
 	// Start keyboard input handler for dashboard controls
 	// Disabled - termdash handles its own keyboard input
 	// if rai.dashboardEnabled.Load() {
@@ -1628,14 +1744,11 @@ func (rai *ReferenceAlignedIndexer) updateStats() {
 	}
 }
 
-
-
 // makeRaw puts the terminal into raw mode and returns the previous state
 
 // restoreTerminal restores the terminal to its previous state
 
 // terminalState holds the terminal state for restoration
-
 
 // prepareDashboardData is deprecated - replaced by direct dashboard updates
 
@@ -1652,7 +1765,7 @@ func (rai *ReferenceAlignedIndexer) dashboardUpdateLoop() {
 			if !rai.dashboardEnabled.Load() || rai.dashboard == nil {
 				continue
 			}
-			
+
 			// Get current stats
 			rai.stats.mutex.RLock()
 			currentRate := rai.stats.currentBlocksPerSec
@@ -1672,7 +1785,7 @@ func (rai *ReferenceAlignedIndexer) dashboardUpdateLoop() {
 
 			// Get current era
 			currentEra := rai.getEraFromSlot(currentSlot)
-			
+
 			// Update performance metrics
 			rai.dashboard.UpdatePerformance(
 				fmt.Sprintf("%.1f b/s", currentRate),
@@ -1689,7 +1802,7 @@ func (rai *ReferenceAlignedIndexer) dashboardUpdateLoop() {
 
 			// Update era progress
 			rai.updateEraProgress(currentSlot)
-			
+
 			// Update errors
 			rai.updateDashboardErrors()
 		}
@@ -1773,28 +1886,28 @@ func (rai *ReferenceAlignedIndexer) updateDashboardErrors() {
 	// Get errors from the unified error system
 	unifiedSystem := errors.Get()
 	stats := unifiedSystem.GetStatistics()
-	
+
 	totalErrors := stats["total_errors"].(int64)
-	
+
 	// Get categorized errors
 	categorizedErrors := make([]string, 0, 5)
-	
+
 	// Get recent errors
 	recentErrors := unifiedSystem.GetRecentErrors(5)
 	for _, err := range recentErrors {
 		if err.Component == "" || err.Operation == "" {
 			continue
 		}
-		
+
 		message := fmt.Sprintf("%s.%s: %s", err.Component, err.Operation, err.Message)
 		if len(message) > 50 {
 			message = message[:47] + "..."
 		}
-		
-		categorizedErrors = append(categorizedErrors, 
+
+		categorizedErrors = append(categorizedErrors,
 			fmt.Sprintf("%s [%d] %s", err.Timestamp.Format("15:04:05"), int(err.Count), message))
 	}
-	
+
 	rai.dashboard.UpdateErrors(int(totalErrors), categorizedErrors)
 }
 
@@ -1856,7 +1969,7 @@ func (rai *ReferenceAlignedIndexer) addActivityEntry(entryType, message string, 
 func (rai *ReferenceAlignedIndexer) addErrorEntry(errorType, message string) {
 	// Route to unified error system
 	unifiedSystem := errors.Get()
-	
+
 	// Map errorType to ErrorType enum
 	var errType errors.ErrorType
 	switch errorType {
@@ -1871,7 +1984,7 @@ func (rai *ReferenceAlignedIndexer) addErrorEntry(errorType, message string) {
 	default:
 		errType = errors.ErrorTypeSystem
 	}
-	
+
 	// Log to unified system
 	unifiedSystem.LogError(errType, "Connection", "Handler", message)
 }
@@ -1899,6 +2012,163 @@ func (rai *ReferenceAlignedIndexer) Shutdown() {
 	}
 
 	rai.logToActivity("system", "Nectar indexer shutdown complete!")
+}
+
+// startConnectionWatchdog monitors for stalled connections and triggers reconnection
+func (rai *ReferenceAlignedIndexer) startConnectionWatchdog() {
+	go func() {
+		// Configuration for stall detection
+		const stallThreshold = 60 * time.Second  // Consider stalled if no blocks for 60s
+		const checkInterval = 10 * time.Second   // Check every 10 seconds
+		const maxReconnectAttempts = 5
+		const baseReconnectDelay = 5 * time.Second
+
+		ticker := time.NewTicker(checkInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-rai.ctx.Done():
+				return
+			case <-rai.reconnectChan:
+				// Triggered by error handler for immediate reconnection
+				rai.logToActivity("system", "Connection watchdog: reconnection triggered by error handler")
+				rai.attemptReconnection(maxReconnectAttempts, baseReconnectDelay)
+			case <-ticker.C:
+				// Check for stall condition
+				lastBlock := rai.lastBlockReceived.Load()
+				if lastBlock == nil {
+					// No blocks received yet - skip check during initial sync startup
+					continue
+				}
+
+				timeSinceLastBlock := time.Since(*lastBlock)
+				if timeSinceLastBlock > stallThreshold && !rai.reconnecting.Load() {
+					rai.logToActivity("system", fmt.Sprintf("Connection watchdog: STALL DETECTED - no blocks for %.0f seconds", timeSinceLastBlock.Seconds()))
+					rai.attemptReconnection(maxReconnectAttempts, baseReconnectDelay)
+				}
+			}
+		}
+	}()
+}
+
+// attemptReconnection tries to reconnect with exponential backoff
+func (rai *ReferenceAlignedIndexer) attemptReconnection(maxAttempts int, baseDelay time.Duration) {
+	// Prevent concurrent reconnection attempts
+	if !rai.reconnecting.CompareAndSwap(false, true) {
+		rai.logToActivity("system", "Reconnection already in progress, skipping")
+		return
+	}
+	defer rai.reconnecting.Store(false)
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		rai.logToActivity("system", fmt.Sprintf("Reconnection attempt %d/%d", attempt, maxAttempts))
+
+		// Close existing connection cleanly
+		rai.connMutex.Lock()
+		if rai.oConn != nil {
+			rai.logToActivity("system", "Closing stale connection...")
+			rai.oConn.Close()
+			rai.oConn = nil
+		}
+		rai.connMutex.Unlock()
+
+		// Wait before reconnecting (exponential backoff)
+		delay := baseDelay * time.Duration(1<<(attempt-1)) // 5s, 10s, 20s, 40s, 80s
+		if delay > 2*time.Minute {
+			delay = 2 * time.Minute // Cap at 2 minutes
+		}
+		rai.logToActivity("system", fmt.Sprintf("Waiting %.0f seconds before reconnect...", delay.Seconds()))
+
+		select {
+		case <-time.After(delay):
+		case <-rai.ctx.Done():
+			return
+		}
+
+		// Attempt to reconnect
+		if err := rai.reconnectChainSync(); err != nil {
+			errors.Get().NetworkError("Reconnect", fmt.Sprintf("Attempt%d", attempt), err)
+			rai.logToActivity("system", fmt.Sprintf("Reconnection attempt %d failed: %v", attempt, err))
+			continue
+		}
+
+		// Success!
+		rai.logToActivity("system", fmt.Sprintf("Reconnection successful after %d attempt(s)", attempt))
+		now := time.Now()
+		rai.lastBlockReceived.Store(&now) // Reset stall timer
+		return
+	}
+
+	// All attempts failed
+	errors.Get().NetworkError("Reconnect", "AllAttemptsFailed",
+		fmt.Errorf("failed to reconnect after %d attempts - manual restart may be required", maxAttempts))
+	rai.logToActivity("system", fmt.Sprintf("CRITICAL: Failed to reconnect after %d attempts", maxAttempts))
+}
+
+// reconnectChainSync establishes a new connection and restarts ChainSync
+func (rai *ReferenceAlignedIndexer) reconnectChainSync() error {
+	rai.logToActivity("system", "Creating new ouroboros connection...")
+
+	// Create new ChainSync config (handlers are still valid)
+	chainSyncConfig := rai.buildChainSyncConfig()
+
+	// Create new connector
+	smartConnector := connection.NewNodeToClientConnector(rai.socketPath, chainSyncConfig)
+
+	// Connect
+	result, err := smartConnector.Connect()
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+
+	// Store new connection
+	rai.connMutex.Lock()
+	rai.oConn = result.Connection
+	rai.connMutex.Unlock()
+
+	// Start error handler for the new connection
+	connection.StartErrorHandler(rai.ctx, result.ErrorChannel, rai.handleConnectionError)
+
+	// Start ChainSync
+	rai.logToActivity("system", "Starting ChainSync on new connection...")
+	if err := rai.startReferenceChainSync(); err != nil {
+		return fmt.Errorf("failed to start ChainSync: %w", err)
+	}
+
+	rai.logToActivity("system", "ChainSync restarted successfully")
+	return nil
+}
+
+// handleConnectionError processes connection errors and triggers reconnection if needed
+func (rai *ReferenceAlignedIndexer) handleConnectionError(errorType, message string) {
+	// First, log to unified error system (existing behavior)
+	rai.addErrorEntry(errorType, message)
+
+	// Check if this is a fatal connection error that requires reconnection
+	fatalPatterns := []string{
+		"connection reset",
+		"broken pipe",
+		"connection refused",
+		"EOF",
+		"connection closed",
+		"use of closed network connection",
+		"i/o timeout",
+	}
+
+	msgLower := strings.ToLower(message)
+	for _, pattern := range fatalPatterns {
+		if strings.Contains(msgLower, pattern) {
+			rai.logToActivity("system", fmt.Sprintf("Fatal connection error detected: %s", message))
+			// Trigger reconnection (non-blocking)
+			select {
+			case rai.reconnectChan <- struct{}{}:
+			default:
+				// Channel full - reconnection already triggered
+			}
+			return
+		}
+	}
 }
 
 // performFullRollback rolls back all blocks after a given slot
@@ -2006,8 +2276,6 @@ func (rai *ReferenceAlignedIndexer) getTipDistance() (distance uint64, percentag
 	return distance, percentage
 }
 
-
-
 func (rai *ReferenceAlignedIndexer) getMemoryUsage() string {
 	// Try to read actual memory usage from /proc/meminfo
 	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
@@ -2046,14 +2314,14 @@ func (rai *ReferenceAlignedIndexer) getCPUUsage() string {
 	return "425%"
 }
 
-
-
 func (rai *ReferenceAlignedIndexer) getLastProcessedSlot() (uint64, error) {
 	var lastSlot sql.NullInt64
 
-	// Find the highest slot number in our database
+	// Find the highest slot number using ORDER BY LIMIT 1 (faster index scan than MAX)
 	err := rai.dbConnections[0].GetDB().Model(&models.Block{}).
-		Select("MAX(slot_no)").
+		Select("slot_no").
+		Order("slot_no DESC").
+		Limit(1).
 		Scan(&lastSlot).Error
 
 	if err != nil {
@@ -2078,13 +2346,16 @@ func (rai *ReferenceAlignedIndexer) buildIntersectionPoints() ([]common.Point, e
 	// Get the last processed slot from database
 	lastSlot, err := rai.getLastProcessedSlot()
 	if err != nil {
-		rai.logToActivity("sync", fmt.Sprintf("Could not get last processed slot, starting from genesis: %v", err))
-		return []common.Point{common.NewPointOrigin()}, nil
+		rai.logToActivity("sync", fmt.Sprintf("Could not get last processed slot, starting from node tip: %v", err))
+		// Return empty array to start from tip
+		return []common.Point{}, nil
 	}
 
 	if lastSlot == 0 {
-		rai.logToActivity("sync", "Starting fresh sync from genesis (no previous blocks found)")
-		return []common.Point{common.NewPointOrigin()}, nil
+		rai.logToActivity("sync", "Starting fresh sync from node's current tip (no previous blocks found)")
+		rai.logToActivity("sync", "Will sync all new blocks from this point forward")
+		// Return empty array to start from tip
+		return []common.Point{}, nil
 	}
 
 	// Smart resumption - we have existing data!
@@ -2092,11 +2363,13 @@ func (rai *ReferenceAlignedIndexer) buildIntersectionPoints() ([]common.Point, e
 	rai.logToActivity("sync", fmt.Sprintf("Found existing blockchain data up to slot %d", lastSlot+20)) // +20 because we subtract safety margin
 	rai.logToActivity("sync", fmt.Sprintf("Resuming from slot %d (with 20-slot safety margin for rollbacks)", lastSlot))
 
-	// Calculate approximate blocks being skipped
+	// Calculate approximate blocks being skipped (using TiDB table statistics for speed)
 	var blocksSkipped int64
-	err = rai.dbConnections[0].GetDB().Model(&models.Block{}).Count(&blocksSkipped).Error
+	err = rai.dbConnections[0].GetDB().Raw(
+		"SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = 'nectar' AND table_name = 'blocks'",
+	).Scan(&blocksSkipped).Error
 	if err == nil {
-		rai.logToActivity("sync", fmt.Sprintf("Skipping %d already-processed blocks - instant startup!", blocksSkipped))
+		rai.logToActivity("sync", fmt.Sprintf("Skipping ~%d already-processed blocks - instant startup!", blocksSkipped))
 	}
 
 	// SAFE RESUMPTION: Get most recent block that definitely exists
@@ -2104,8 +2377,12 @@ func (rai *ReferenceAlignedIndexer) buildIntersectionPoints() ([]common.Point, e
 	var points []common.Point
 
 	// Strategy: Find the most recent block we definitely have
-	// This is much safer than trying exact slots that might not exist
-	err = rai.dbConnections[0].GetDB().Order("slot_no DESC").First(&resumeBlock).Error
+	// Using explicit column selection and index hint for faster query
+	err = rai.dbConnections[0].GetDB().Model(&models.Block{}).
+		Select("hash, slot_no, block_no, epoch_no").
+		Order("slot_no DESC").
+		Limit(1).
+		First(&resumeBlock).Error
 	if err == nil {
 		// SUCCESS: We have the actual latest block to resume from
 		point := common.NewPoint(*resumeBlock.SlotNo, resumeBlock.Hash)
@@ -2115,7 +2392,7 @@ func (rai *ReferenceAlignedIndexer) buildIntersectionPoints() ([]common.Point, e
 		// Verify this makes sense (should be close to our calculated lastSlot)
 		slotDiff := int64(*resumeBlock.SlotNo) - int64(lastSlot)
 		if slotDiff > 100 || slotDiff < -100 {
-			errors.Get().ProcessingError("Sync", "ResumeVerify", 
+			errors.Get().ProcessingError("Sync", "ResumeVerify",
 				fmt.Errorf("resume slot %d differs from calculated %d by %d slots", *resumeBlock.SlotNo, lastSlot, slotDiff))
 		}
 	} else {

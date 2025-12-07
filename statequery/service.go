@@ -202,10 +202,10 @@ func (s *Service) runQueries() error {
 	// The state query socket might be connected to live mainnet (epoch 500+)
 	// while the sync socket is processing Byron (epoch 0-207)
 	if epochNo > 207 {
-		// Get the actual syncing position from database
+		// Get the actual syncing position from database (using ORDER BY LIMIT 1 for speed)
 		var currentSlot uint64
 		var currentEpoch uint32
-		err := s.db.Model(&models.Block{}).Select("MAX(slot_no)").Scan(&currentSlot).Error
+		err := s.db.Model(&models.Block{}).Select("slot_no").Order("slot_no DESC").Limit(1).Scan(&currentSlot).Error
 		if err == nil && currentSlot > 0 {
 			// Calculate epoch from slot (432000 slots per epoch)
 			currentEpoch = uint32(currentSlot / 432000)

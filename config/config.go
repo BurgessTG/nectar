@@ -20,6 +20,7 @@ type Config struct {
 	Metadata    MetadataConfig    `toml:"metadata"`
 	StateQuery  StateQueryConfig  `toml:"state_query"`
 	Auth        AuthConfig        `toml:"auth"`
+	Indexing    IndexingConfig    `toml:"indexing"`
 }
 
 // DatabaseConfig holds database connection settings
@@ -114,6 +115,40 @@ type AuthConfig struct {
 	Secret   string `toml:"secret"`
 }
 
+// IndexingConfig controls what blockchain data to index (selective indexing)
+// By default, all components are enabled for full indexing.
+// Set individual options to false to skip specific data types.
+type IndexingConfig struct {
+	// Core components (always required)
+	Transactions bool `toml:"transactions"`
+	Blocks       bool `toml:"blocks"`
+
+	// Token/Asset indexing
+	Metadata bool `toml:"metadata"`
+	Assets   bool `toml:"assets"`
+	Minting  bool `toml:"minting"`
+
+	// UTxO set tracking
+	UTXOs   bool `toml:"utxos"`
+	Inputs  bool `toml:"inputs"`
+	Outputs bool `toml:"outputs"`
+
+	// Staking and governance
+	Certificates bool `toml:"certificates"`
+	Governance   bool `toml:"governance"`
+	Withdrawals  bool `toml:"withdrawals"`
+
+	// Smart contracts
+	Scripts    bool `toml:"scripts"`
+	Collateral bool `toml:"collateral"`
+
+	// Wallet relationship tracking
+	WalletConnections bool `toml:"wallet_connections"`
+
+	// Metadata filtering (empty = index all labels)
+	MetadataLabels []uint64 `toml:"metadata_labels"`
+}
+
 // Load loads configuration from TOML file with environment variable overrides
 func Load(path string) (*Config, error) {
 	// Default configuration
@@ -171,6 +206,37 @@ func Load(path string) (*Config, error) {
 			Username: "admin",
 			Password: "admin",
 			Secret:   "nectar-secret-key",
+		},
+		Indexing: IndexingConfig{
+			// Full indexing enabled by default
+			// Users can disable specific components in nectar.toml
+			Transactions: true,
+			Blocks:       true,
+
+			// Token/Asset indexing
+			Metadata: true,
+			Assets:   true,
+			Minting:  true,
+
+			// UTxO set tracking
+			UTXOs:   true,
+			Inputs:  true,
+			Outputs: true,
+
+			// Staking and governance
+			Certificates: true,
+			Governance:   true,
+			Withdrawals:  true,
+
+			// Smart contracts
+			Scripts:    true,
+			Collateral: true,
+
+			// Wallet relationship tracking (optional, can be resource intensive)
+			WalletConnections: false,
+
+			// Index all metadata labels by default (empty = all)
+			MetadataLabels: []uint64{},
 		},
 	}
 

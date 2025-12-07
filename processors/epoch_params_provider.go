@@ -260,13 +260,15 @@ func (epp *EpochParamsProvider) ProvideEpochParams(epochNo uint32) error {
 // BackfillEpochParams creates parameters for all past epochs
 func (epp *EpochParamsProvider) BackfillEpochParams() error {
 	log.Printf("[EPOCH_PARAMS] Starting backfill of epoch parameters")
-	
-	// Get max epoch from blocks
+
+	// Get max epoch from blocks (using ORDER BY LIMIT 1 for faster index scan)
 	var maxEpoch uint32
 	err := epp.db.Model(&models.Block{}).
-		Select("MAX(epoch_no)").
+		Select("epoch_no").
+		Order("epoch_no DESC").
+		Limit(1).
 		Scan(&maxEpoch).Error
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to get max epoch: %w", err)
 	}

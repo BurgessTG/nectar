@@ -62,9 +62,17 @@ func NewNodeToClientConnector(socketPath string, chainSync chainsync.Config) *No
 
 // Connect establishes a Node-to-Client connection
 func (nc *NodeToClientConnector) Connect() (*ConnectionResult, error) {
-	conn, err := net.Dial("unix", nc.socketPath)
+	var conn net.Conn
+	var err error
+
+	if strings.Contains(nc.socketPath, ":") {
+		conn, err = net.Dial("tcp", nc.socketPath)
+	} else {
+		conn, err = net.Dial("unix", nc.socketPath)
+	}
+
 	if err != nil {
-		return nil, fmt.Errorf("socket connection failed: %w", err)
+		return nil, fmt.Errorf("connection failed: %w", err)
 	}
 
 	errorChan := make(chan error, 10)
