@@ -48,6 +48,7 @@ type BlockProcessor struct {
 	metadataProcessor         *MetadataProcessor
 	scriptProcessor           *ScriptProcessor
 	walletConnectionProcessor *WalletConnectionProcessor
+	tokenHolderProcessor      *TokenHolderProcessor // Tracks token holder balances in real-time
 	epochParamsProvider       *EpochParamsProvider
 	stateQueryService         StateQueryService
 	txSemaphore               chan struct{} // Limits concurrent transaction processing
@@ -67,9 +68,31 @@ func NewBlockProcessor(db *gorm.DB, cfg *config.IndexingConfig) *BlockProcessor 
 		metadataProcessor:         NewMetadataProcessor(db),
 		scriptProcessor:           NewScriptProcessor(db),
 		walletConnectionProcessor: NewWalletConnectionProcessor(db),
+		tokenHolderProcessor:      NewTokenHolderProcessor(db, nil), // nil eventChan for now, can be wired up later
 		epochParamsProvider:       NewEpochParamsProvider(db),
-		txSemaphore:               make(chan struct{}, 32), // Increased to 32 for our powerful system
+		txSemaphore:               make(chan struct{}, 16), // Reduced to 16 for memory efficiency
 		currentEraConfig:          GetEraConfig(0),         // Start with Byron config
+		currentEpoch:              0,
+	}
+	return bp
+}
+
+// NewBlockProcessorWithEvents creates a block processor with event channel for real-time updates
+func NewBlockProcessorWithEvents(db *gorm.DB, cfg *config.IndexingConfig, eventChan chan<- models.TokenHolderEvent) *BlockProcessor {
+	stakeAddressCache := NewStakeAddressCache(db)
+	bp := &BlockProcessor{
+		db:                        db,
+		config:                    cfg,
+		stakeAddressCache:         stakeAddressCache,
+		errorCollector:            GetGlobalErrorCollector(),
+		assetProcessor:            NewAssetProcessor(db),
+		metadataProcessor:         NewMetadataProcessor(db),
+		scriptProcessor:           NewScriptProcessor(db),
+		walletConnectionProcessor: NewWalletConnectionProcessor(db),
+		tokenHolderProcessor:      NewTokenHolderProcessor(db, eventChan),
+		epochParamsProvider:       NewEpochParamsProvider(db),
+		txSemaphore:               make(chan struct{}, 16),
+		currentEraConfig:          GetEraConfig(0),
 		currentEpoch:              0,
 	}
 	return bp
@@ -426,6 +449,14 @@ func (bp *BlockProcessor) processTransaction(ctx context.Context, tx *gorm.DB, b
 	if bp.walletConnectionProcessor != nil {
 		if err := bp.walletConnectionProcessor.ProcessTransaction(tx, txHash, slotNo, transaction); err != nil {
 			unifiederrors.Get().Warning("BlockProcessor", "ProcessWalletConnections", fmt.Sprintf("Failed to process wallet connections: %v", err))
+		}
+	}
+
+	// Process token holders - track incremental balance changes for instant holder queries
+	// This runs after outputs and assets are processed so we can look up token transfers
+	if bp.tokenHolderProcessor != nil {
+		if err := bp.tokenHolderProcessor.ProcessTransaction(tx, txHash, slotNo, transaction); err != nil {
+			unifiederrors.Get().Warning("BlockProcessor", "ProcessTokenHolders", fmt.Sprintf("Failed to process token holders: %v", err))
 		}
 	}
 
