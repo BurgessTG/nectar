@@ -181,6 +181,92 @@ func (wcp *WalletConnectionProcessor) upsertConnections(tx *gorm.DB, connections
 	return tx.Exec(sql, valueArgs...).Error
 }
 
+// AffectedWalletPair identifies a sender-receiver pair that may need recalculation after rollback
+type AffectedWalletPair struct {
+	SenderAddress   string
+	ReceiverAddress string
+}
+
+// CaptureAffectedPairs finds all wallet pairs that have transactions in rolled-back blocks.
+// Must be called BEFORE cascade-deleting blocks, while evidence still exists.
+func (wcp *WalletConnectionProcessor) CaptureAffectedPairs(tx *gorm.DB, rollbackSlot uint64) ([]AffectedWalletPair, error) {
+	var pairs []AffectedWalletPair
+	err := tx.Raw(`
+		SELECT DISTINCT sender_address, receiver_address
+		FROM wallet_connection_txs
+		WHERE slot_no > ?
+	`, rollbackSlot).Scan(&pairs).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to capture affected wallet pairs: %w", err)
+	}
+
+	log.Printf("[WALLET_CONN] Rollback: captured %d affected pairs", len(pairs))
+	return pairs, nil
+}
+
+// RecalculateAfterRollback removes rolled-back transaction records and reaggregates wallet connections.
+// Must be called AFTER cascade-deleting blocks.
+func (wcp *WalletConnectionProcessor) RecalculateAfterRollback(tx *gorm.DB, affected []AffectedWalletPair, rollbackSlot uint64) error {
+	if len(affected) == 0 {
+		return nil
+	}
+
+	// Step 1: Delete all wallet_connection_txs after the rollback slot
+	result := tx.Exec(`DELETE FROM wallet_connection_txs WHERE slot_no > ?`, rollbackSlot)
+	if result.Error != nil {
+		return fmt.Errorf("failed to delete rolled-back wallet connection txs: %w", result.Error)
+	}
+	log.Printf("[WALLET_CONN] Rollback: deleted %d wallet_connection_txs rows", result.RowsAffected)
+
+	// Step 2: Reaggregate each affected pair from remaining txs
+	deleted := 0
+	updated := 0
+
+	for _, pair := range affected {
+		var stats struct {
+			TxCount    int64
+			TotalAda   uint64
+			FirstSlot  uint64
+			LastSlot   uint64
+			LastTxHash []byte
+		}
+		err := tx.Raw(`
+			SELECT COUNT(*) AS tx_count,
+			       COALESCE(SUM(ada_amount), 0) AS total_ada,
+			       COALESCE(MIN(slot_no), 0) AS first_slot,
+			       COALESCE(MAX(slot_no), 0) AS last_slot,
+			       MAX(tx_hash) AS last_tx_hash
+			FROM wallet_connection_txs
+			WHERE sender_address = ? AND receiver_address = ?
+		`, pair.SenderAddress, pair.ReceiverAddress).Scan(&stats).Error
+		if err != nil {
+			log.Printf("[WALLET_CONN] Warning: Failed to reaggregate pair %s→%s: %v",
+				pair.SenderAddress, pair.ReceiverAddress, err)
+			continue
+		}
+
+		if stats.TxCount == 0 {
+			// No remaining txs — delete the aggregate row
+			tx.Exec(`DELETE FROM wallet_connections WHERE sender_address = ? AND receiver_address = ?`,
+				pair.SenderAddress, pair.ReceiverAddress)
+			deleted++
+		} else {
+			// Update aggregate with remaining data
+			tx.Exec(`
+				UPDATE wallet_connections
+				SET total_tx_count = ?, total_ada_sent = ?,
+				    first_tx_slot = ?, last_tx_slot = ?, last_tx_hash = ?
+				WHERE sender_address = ? AND receiver_address = ?
+			`, stats.TxCount, stats.TotalAda, stats.FirstSlot, stats.LastSlot,
+				stats.LastTxHash, pair.SenderAddress, pair.ReceiverAddress)
+			updated++
+		}
+	}
+
+	log.Printf("[WALLET_CONN] Rollback complete: updated=%d, deleted=%d", updated, deleted)
+	return nil
+}
+
 // BackfillFromSlotRange populates wallet connections from existing data in a slot range
 // This is useful for backfilling data that was indexed before this feature was added
 func (wcp *WalletConnectionProcessor) BackfillFromSlotRange(startSlot, endSlot uint64) error {
@@ -191,29 +277,57 @@ func (wcp *WalletConnectionProcessor) BackfillFromSlotRange(startSlot, endSlot u
 		INSERT INTO wallet_connections
 			(sender_address, receiver_address, total_tx_count, total_ada_sent, first_tx_slot, last_tx_slot, last_tx_hash)
 		SELECT
-			spent_out.address as sender_address,
-			recv_out.address as receiver_address,
-			COUNT(DISTINCT ti.tx_in_hash) as total_tx_count,
-			COALESCE(SUM(recv_out.value), 0) as total_ada_sent,
-			MIN(b.slot_no) as first_tx_slot,
-			MAX(b.slot_no) as last_tx_slot,
-			MAX(ti.tx_in_hash) as last_tx_hash
-		FROM tx_ins ti
-		INNER JOIN tx_outs spent_out ON spent_out.tx_hash = ti.tx_out_hash AND spent_out.` + "`index`" + ` = ti.tx_out_index
-		INNER JOIN tx_outs recv_out ON recv_out.tx_hash = ti.tx_in_hash
-		INNER JOIN txes t ON t.hash = ti.tx_in_hash
-		INNER JOIN blocks b ON b.hash = t.block_hash
-		WHERE b.slot_no >= ? AND b.slot_no < ?
-			AND spent_out.address != recv_out.address
-		GROUP BY spent_out.address, recv_out.address
+			events.sender_address,
+			events.receiver_address,
+			COUNT(*) as total_tx_count,
+			COALESCE(SUM(events.ada_amount), 0) as total_ada_sent,
+			MIN(events.slot_no) as first_tx_slot,
+			MAX(events.slot_no) as last_tx_slot,
+			MAX(events.tx_hash) as last_tx_hash
+		FROM (
+			SELECT
+				senders.tx_hash,
+				senders.sender_address,
+				receivers.receiver_address,
+				receivers.ada_amount,
+				receivers.slot_no
+			FROM (
+				SELECT DISTINCT
+					ti.tx_in_hash as tx_hash,
+					spent_out.address as sender_address
+				FROM tx_ins ti
+				INNER JOIN tx_outs spent_out
+					ON spent_out.tx_hash = ti.tx_out_hash
+					AND spent_out.` + "`index`" + ` = ti.tx_out_index
+				INNER JOIN txes t ON t.hash = ti.tx_in_hash
+				INNER JOIN blocks b ON b.hash = t.block_hash
+				WHERE b.slot_no >= ? AND b.slot_no < ?
+					AND CHAR_LENGTH(spent_out.address) <= 256
+			) senders
+			INNER JOIN (
+				SELECT
+					txo.tx_hash,
+					txo.address as receiver_address,
+					txo.value as ada_amount,
+					b.slot_no
+				FROM tx_outs txo
+				INNER JOIN txes t ON t.hash = txo.tx_hash
+				INNER JOIN blocks b ON b.hash = t.block_hash
+				WHERE b.slot_no >= ? AND b.slot_no < ?
+					AND CHAR_LENGTH(txo.address) <= 256
+			) receivers ON receivers.tx_hash = senders.tx_hash
+			WHERE senders.sender_address != receivers.receiver_address
+		) events
+		GROUP BY events.sender_address, events.receiver_address
 		ON DUPLICATE KEY UPDATE
 			total_tx_count = wallet_connections.total_tx_count + VALUES(total_tx_count),
 			total_ada_sent = wallet_connections.total_ada_sent + VALUES(total_ada_sent),
+			first_tx_slot = LEAST(wallet_connections.first_tx_slot, VALUES(first_tx_slot)),
 			last_tx_slot = GREATEST(wallet_connections.last_tx_slot, VALUES(last_tx_slot)),
 			last_tx_hash = VALUES(last_tx_hash)
 	`
 
-	err := wcp.db.Exec(sql, startSlot, endSlot).Error
+	err := wcp.db.Exec(sql, startSlot, endSlot, startSlot, endSlot).Error
 	if err != nil {
 		return fmt.Errorf("failed to backfill connections for slots %d-%d: %w", startSlot, endSlot, err)
 	}
@@ -230,21 +344,40 @@ func (wcp *WalletConnectionProcessor) BackfillIndividualTxs(startSlot, endSlot u
 		INSERT IGNORE INTO wallet_connection_txs
 			(sender_address, receiver_address, tx_hash, slot_no, ada_amount)
 		SELECT
-			spent_out.address as sender_address,
-			recv_out.address as receiver_address,
-			ti.tx_in_hash as tx_hash,
-			b.slot_no as slot_no,
-			recv_out.value as ada_amount
-		FROM tx_ins ti
-		INNER JOIN tx_outs spent_out ON spent_out.tx_hash = ti.tx_out_hash AND spent_out.` + "`index`" + ` = ti.tx_out_index
-		INNER JOIN tx_outs recv_out ON recv_out.tx_hash = ti.tx_in_hash
-		INNER JOIN txes t ON t.hash = ti.tx_in_hash
-		INNER JOIN blocks b ON b.hash = t.block_hash
-		WHERE b.slot_no >= ? AND b.slot_no < ?
-			AND spent_out.address != recv_out.address
+			senders.sender_address,
+			receivers.receiver_address,
+			senders.tx_hash,
+			receivers.slot_no,
+			receivers.ada_amount
+		FROM (
+			SELECT DISTINCT
+				ti.tx_in_hash as tx_hash,
+				spent_out.address as sender_address
+			FROM tx_ins ti
+			INNER JOIN tx_outs spent_out
+				ON spent_out.tx_hash = ti.tx_out_hash
+				AND spent_out.` + "`index`" + ` = ti.tx_out_index
+			INNER JOIN txes t ON t.hash = ti.tx_in_hash
+			INNER JOIN blocks b ON b.hash = t.block_hash
+			WHERE b.slot_no >= ? AND b.slot_no < ?
+				AND CHAR_LENGTH(spent_out.address) <= 256
+		) senders
+		INNER JOIN (
+			SELECT
+				txo.tx_hash,
+				txo.address as receiver_address,
+				txo.value as ada_amount,
+				b.slot_no
+			FROM tx_outs txo
+			INNER JOIN txes t ON t.hash = txo.tx_hash
+			INNER JOIN blocks b ON b.hash = t.block_hash
+			WHERE b.slot_no >= ? AND b.slot_no < ?
+				AND CHAR_LENGTH(txo.address) <= 256
+		) receivers ON receivers.tx_hash = senders.tx_hash
+		WHERE senders.sender_address != receivers.receiver_address
 	`
 
-	err := wcp.db.Exec(sql, startSlot, endSlot).Error
+	err := wcp.db.Exec(sql, startSlot, endSlot, startSlot, endSlot).Error
 	if err != nil {
 		return fmt.Errorf("failed to backfill individual txs for slots %d-%d: %w", startSlot, endSlot, err)
 	}

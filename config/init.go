@@ -39,9 +39,11 @@ func generateDefaultConfig() string {
 version = "1.0"
 
 [database]
-# Database connection string
-# For TiDB, use: root:password@tcp(host:port)/database?charset=utf8mb4&parseTime=True
-# For HAProxy load balancer: root:password@tcp(127.0.0.1:3999)/database?...
+# Database driver: "mysql" for MySQL 8/InnoDB, "tidb" for TiDB-specific tuning.
+driver = "mysql"
+# Database connection string.
+# MySQL: user:password@tcp(host:3306)/database?charset=utf8mb4&parseTime=True&loc=Local
+# TiDB: root:password@tcp(host:4000)/database?charset=utf8mb4&parseTime=True&loc=Local
 dsn = ""
 # Optimized for single-node with multiple TiDB servers
 connection_pool = 32
@@ -114,9 +116,14 @@ user_agent = "Nectar/1.0"
 
 [state_query]
 # Enable state query service for rewards calculation
-enabled = true
+enabled = false
 # Socket path (uses cardano.node_socket if empty)
 socket_path = ""
+
+[indexing]
+# "honeycomb" keeps only base chain data and Honeycomb product tables.
+# Use "full" when you intentionally want the broader Nectar/db-sync-style footprint.
+profile = "honeycomb"
 `
 }
 

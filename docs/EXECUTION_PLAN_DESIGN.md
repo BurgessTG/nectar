@@ -1,11 +1,22 @@
 # Nectar Execution Plan Design Document
 **Version**: 1.0  
 **Date**: June 27, 2025  
-**Status**: Proposal
+**Status**: Design proposal only; not implemented in the active binary
+
+## Current-State Caveat (May 26, 2026)
+
+No execution-plan runtime is active today. The current CLI supports `init`,
+`migrate-env`, `version`, `help`, `--config`/`-c`, and `--clear-shelley`.
+There is no active `nectar plan ...` subcommand, `--plan` flag,
+execution-plan parser, modular plan processor, or generated GraphQL schema in
+the indexer. The active configuration has selective indexing booleans, which
+are narrower than the plan language proposed here.
 
 ## Executive Summary
 
-This document outlines the design and implementation strategy for adding execution plans to Nectar, transforming it from a full-chain indexer into the most versatile GraphQL indexer for Cardano. With execution plans, users can:
+This document outlines a design and implementation strategy for adding execution
+plans to Nectar. It is retained as planning material, not as a description of
+current runtime behavior. With the proposed execution plans, users could:
 
 - Start indexing from any point in the chain
 - Select only the data they need (e.g., specific assets, addresses, or time ranges)
@@ -329,6 +340,8 @@ modules = { core = true, assets = true }
 ```
 
 ### 2. CLI Integration
+Status: design only. The active CLI currently implements `init`, `migrate-env`, `version`, `help`, `--config/-c`, and `--clear-shelley`; the `nectar plan ...` commands below are not implemented.
+
 ```bash
 # Initialize with execution plan
 nectar init --with-plan bubble-maps

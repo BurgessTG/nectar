@@ -145,7 +145,19 @@ func (h *DashboardHandlers) HandlePartialStatus(c *gin.Context) {
 	if snapshot.TipSlot > snapshot.CurrentSlot {
 		slotsBehind = int64(snapshot.TipSlot - snapshot.CurrentSlot)
 	}
-	
+
+	// Friendly status text for "slots behind"
+	behindText := ""
+	if slotsBehind <= 0 {
+		behindText = "At tip"
+	} else if slotsBehind < 60 {
+		behindText = "At tip (~" + fmt.Sprintf("%d", slotsBehind) + "s)"
+	} else if slotsBehind < 3600 {
+		behindText = fmt.Sprintf("%d slots behind (~%dm)", slotsBehind, slotsBehind/60)
+	} else {
+		behindText = fmt.Sprintf("%d slots behind (~%dh)", slotsBehind, slotsBehind/3600)
+	}
+
 	data := gin.H{
 		"Status":         status,
 		"CurrentSlot":    snapshot.CurrentSlot,
@@ -155,6 +167,7 @@ func (h *DashboardHandlers) HandlePartialStatus(c *gin.Context) {
 		"CurrentEra":     snapshot.CurrentEra,
 		"TotalBlocks":    snapshot.TotalBlocks,
 		"SlotsBehind":    slotsBehind,
+		"BehindText":     behindText,
 	}
 	
 	c.HTML(http.StatusOK, "partials/status.html", data)

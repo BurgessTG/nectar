@@ -1,81 +1,72 @@
 # Nectar Configuration File
-# Copy this file to nectar.toml and update with your values
+# Copy this file to nectar.toml and update local values.
 version = "1.0"
 
 [database]
-# Database connection string
-# For TiDB via HAProxy: use port 4100 for load balancing across TiDB servers
-# For direct TiDB connection: use ports 4000-4002
-dsn = \"user:password@tcp(localhost:4100)/nectar?charset=utf8mb4&parseTime=True&loc=Local&timeout=60s&readTimeout=60s&writeTimeout=60s&maxAllowedPacket=134217728&autocommit=true&interpolateParams=true\"
-connection_pool = 16      # Base pool size (multiplied by 8x internally = 128 total)
-max_idle_conns = 32       # Keep connections ready for bursts
-max_open_conns = 64       # Hard limit to prevent connection exhaustion
-conn_max_lifetime = 300000000000   # 5 minutes in nanoseconds (recycle connections)
+driver = "mysql"
+# MySQL-compatible DSN. Use MySQL 8 for the simpler target, or TiDB if needed.
+# MySQL example:
+# dsn = "user:password@tcp(localhost:3306)/nectar?charset=utf8mb4&parseTime=True&loc=Local"
+# TiDB example:
+# dsn = "root:@tcp(localhost:4000)/nectar?charset=utf8mb4&parseTime=True&loc=Local"
+dsn = "user:password@tcp(localhost:3306)/nectar?charset=utf8mb4&parseTime=True&loc=Local"
+connection_pool = 8
+max_idle_conns = 4
+max_open_conns = 8
+conn_max_lifetime = 1800000000000
 
 [cardano]
-# Path to Cardano node socket
-node_socket = "/opt/cardano/cnode/sockets/node.socket"
-# Network magic: 764824073 (mainnet), 1097911063 (testnet), 1 (preprod), 2 (preview)
+# Dolos 1.0 / Cardano node socket path. Do not use Demeter-specific paths here.
+node_socket = "/path/to/dolos-or-cardano/node.socket"
+# Network magic: 764824073 (mainnet), 1 (preprod), 2 (preview)
 network_magic = 764824073
-# Protocol mode: "auto", "node-to-node", "node-to-client"
 protocol_mode = "auto"
 
-[cardano.rewards]
-# Reward calculation parameters
-treasury_tax = 0.20
-monetary_expansion = 0.003
-optimal_pool_count = 500
+[indexing]
+profile = "honeycomb"
+transactions = true
+blocks = true
+metadata = true
+assets = true
+minting = true
+utxos = false
+inputs = true
+outputs = true
+certificates = false
+governance = false
+withdrawals = false
+scripts = false
+collateral = false
+wallet_connections = true
 
 [performance]
-# Number of parallel workers for block processing
-worker_count = 48         # Optimized for multi-era sync (Byron needs ~20, Shelley+ needs 40+)
-# Enable bulk sync mode for faster initial sync
+worker_count = 4
 bulk_mode_enabled = true
-# Number of blocks to fetch in bulk mode
-bulk_fetch_range_size = 20000     # Increased for better throughput
-# Statistics update interval
-stats_interval = 5000000000       # 5 seconds in nanoseconds
-# Blockfetch timeout
-blockfetch_timeout = 60000000000  # 60 seconds in nanoseconds
-# Size of the block processing queue
-block_queue_size = 200000         # Large queue for bulk operations
+bulk_fetch_range_size = 2000
+stats_interval = 5000000000
+blockfetch_timeout = 60000000000
+block_queue_size = 2000
 
 [dashboard]
-# Enable dashboard display
 enabled = true
-# Dashboard type: "terminal", "web", "both", "none"
 type = "both"
-# Web dashboard port (if type is "web" or "both")
 web_port = 8080
-# Show detailed logs in dashboard
 detailed_log = false
 
 [monitoring]
-# Enable Prometheus metrics
 metrics_enabled = true
-# Metrics server port
 metrics_port = 9090
-# Log level: "debug", "info", "warn", "error"
 log_level = "info"
-# Log format: "json", "text"
 log_format = "json"
 
 [metadata]
-# Enable off-chain metadata fetching
-enabled = false  # Disabled during initial sync for performance
-# Number of metadata fetcher workers
-worker_count = 12
-# Metadata queue size
-queue_size = 5000
-# Rate limit (requests per second)
+enabled = true
+worker_count = 4
+queue_size = 10000
 rate_limit = 50
-# Maximum retries for failed requests
 max_retries = 3
-# User agent for metadata requests
 user_agent = "Nectar/1.0"
 
 [state_query]
-# Enable state query service for rewards calculation
-enabled = true
-# Socket path (uses cardano.node_socket if empty)
+enabled = false
 socket_path = ""

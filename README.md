@@ -1,110 +1,63 @@
-# Nectar 🍯
+# Nectar Indexer
 
-A Cardano blockchain indexer designed for TiDB's distributed architecture.
+Nectar is Honeycomb's active Go Cardano indexer.
 
-## ⚠️ Under Heavy Development
+## Role
 
-This project is in active development and not yet ready for production use. We're working on indexing the Cardano blockchain into TiDB to enable efficient querying of on-chain data.
+The indexer owns chain ingestion and derived blockchain tables. The backend reads the indexed data and should not connect directly to Demeter/Oura-era ingestion paths.
 
-## What is Nectar?
+## Current commands
 
-Nectar indexes Cardano blockchain data into TiDB, making it queryable via SQL. It processes all eras from Byron to Conway, storing transactions, UTXOs, stake pools, delegations, and more.
-
-## Why TiDB?
-
-TiDB offers unique advantages for blockchain data:
-
-- **High Availability**: No single point of failure. TiKV nodes replicate data across the cluster with Raft consensus
-- **Auto-Sharding**: Data automatically distributed across nodes without manual partitioning
-- **TiFlash**: Columnar storage engine for analytical queries on historical blockchain data
-- **HTAP**: Hybrid transactional/analytical processing - index new blocks while running complex analytics
-- **Compressed Storage**: TiKV's RocksDB backend efficiently compresses blockchain data
-- **Online DDL**: Schema changes without downtime as the blockchain evolves
-- **Horizontal Scaling**: Add nodes to handle growing blockchain data without re-architecting
-
-Traditional databases require complex sharding schemes or struggle with the continuous growth of blockchain data. TiDB handles this transparently.
-
-## Current Status
-
-- Actively syncing Cardano mainnet
-- Processing all transaction types across all eras
-- Building comprehensive indexes for efficient queries
-- Implementing memory optimizations and performance improvements
-
-## Contributing
-
-We welcome contributions! This is an open-source project and we're looking for help with:
-
-- Performance optimizations
-- Additional query indexes
-- Documentation improvements
-- Testing and bug reports
-- Feature suggestions
-
-Please feel free to:
-- Open issues for bugs or feature requests
-- Submit pull requests
-- Join discussions about the project direction
-- Share your use cases and requirements
-
-## Development Setup
-
-### Requirements
-
-- Go 1.21+
-- TiDB cluster (or TiUP playground for testing)
-- Cardano node with local socket access
-- 8+ CPU cores, 16GB+ RAM recommended
-
-### Quick Start
-
-1. Clone the repository:
 ```bash
-git clone https://github.com/honeycomb-tech/nectar.git
-cd nectar
+go mod download
+go run .
+go test ./...
+go build ./...
 ```
 
-2. Build:
+Configure `nectar.toml`, database DSN, worker settings, and the Cardano/Dolos socket path before running against a real chain source.
+
+Mithril/Dolos prep is available without starting the indexer:
+
 ```bash
-go build -o nectar .
+go run . bootstrap-dolos --dolos-dir /path/to/cardano.nodes --config nectar.toml
+go run . bootstrap-dolos --dolos-dir /path/to/cardano.nodes --config nectar.toml --mysql-dsn '<dsn>' --write
+go run . bootstrap-dolos --dolos-dir /path/to/cardano.nodes --write-runbook bootstrap.md --write-script bootstrap.sh
 ```
 
-3. Configure (create `nectar.toml`):
-```toml
-[database]
-dsn = "root:password@tcp(localhost:4000)/nectar"
+Current UTxO seeding from Dolos UTxO RPC is available as a separate command:
 
-[cardano]
-node_socket = "/path/to/node.socket"
-network_magic = 764824073  # mainnet
-```
-
-4. Run:
 ```bash
-./nectar
+go run . snapshot-import --config nectar.toml --limit 1000
+go run . snapshot-import --config nectar.toml --manifest-only --write-manifest snapshot-manifest.json
+go run . snapshot-import --config nectar.toml --apply --replace-utxo
+go run . snapshot-import --source filesystem --snapshot-dir /path/to/extracted-mithril-snapshot
+go run . snapshot-import --source filesystem --snapshot-dir /path/to/extracted-mithril-snapshot --config nectar.toml --apply --replace-utxo
+go run . snapshot-import --source ndjson --utxo-ndjson current-utxo.ndjson --apply --replace-utxo
 ```
 
-## Architecture
+The Dolos UTxO RPC import path seeds current holder state and refreshes `token_holders` directly from the current UTxO rows. `--source filesystem` can apply a Dingo-compatible UTxO-HD `ledger/<slot>/tables/tvar` file into the same Nectar base tables (`tx_outs`, `ma_tx_outs`, `multi_assets`) and holder refresh path; the file is memory-mapped to avoid copying a mainnet-sized table into the Go heap. `--source ndjson` applies a parsed Dingo-style current UTxO NDJSON file into that same path. Full chart data requires an unfiltered apply; partial apply with `--limit`, `--policy`, or `--asset-name` is refused unless `--allow-partial-apply` is passed for tests. `--manifest-only` writes table-level coverage without connecting to live RPC. Legacy ledger-state file decoding remains separate. Historical wallet graph tables and rewards still require separate, defensible sources; they are not faked by snapshot import.
 
-Nectar uses a modular processor architecture:
-- **Block Processor**: Orchestrates processing of each block
-- **Transaction Processor**: Handles all transaction types
-- **Certificate Processor**: Processes stake pool and delegation certificates
-- **Asset Processor**: Indexes native tokens and NFTs
-- **Metadata Processor**: Stores transaction metadata
-- **Script Processor**: Handles Plutus scripts
+The indexer event bus listener is configured with `EVENT_BUS_ADDRESS` and defaults to `0.0.0.0:9000`. The backend subscriber uses `NECTAR_EVENT_BUS`.
 
-See [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) for detailed code organization.
+## Current caveats
 
-## License
+- The active startup migration path is GORM/manual DDL, not the historical SQL files under `indexer/migrations/`.
+- DB code uses the MySQL driver but still applies TiDB-specific defaults and optimizations.
+- `token_holders` and `token_wallet_connections` are created by the active startup migration path; backfill scripts and historical backend SQL still duplicate parts of that DDL.
+- Some helper ops files still assume TiDB service names or port `4000`.
+- The Dockerfile Go image is older than the `go.mod` toolchain declaration.
 
-Apache 2.0 - See [LICENSE](LICENSE) for details.
+## Current cleanup stance
 
-## Contact
+No source refactor is happening in the cleanup pass. Old root-level indexer planning/audit docs were archived at:
 
-- GitHub Issues: [github.com/honeycomb-tech/nectar/issues](https://github.com/honeycomb-tech/nectar/issues)
-- Discussions: [github.com/honeycomb-tech/nectar/discussions](https://github.com/honeycomb-tech/nectar/discussions)
+```text
+archive/2026-05-cleanup/legacy-docs/indexer-root-docs/
+```
 
----
+Current indexer strategy notes live at `../docs/INDEXER.md` and database strategy notes live at `../docs/DATABASE.md`.
 
-Built with ❤️ for the Cardano community
+## Future organization target
+
+After contracts and database direction are stable, split orchestration from processors, database, events, dashboard, and Mithril bootstrap code. Do not do that during cleanup-only work.

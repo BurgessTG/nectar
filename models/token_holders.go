@@ -31,13 +31,14 @@ func (t *TokenHolder) BeforeCreate(tx *gorm.DB) error {
 // TokenHolderEvent represents a real-time event for holder changes.
 // Used for pushing updates to the backend via event bus.
 // JSON tags match the Go struct field names for consistency with backend parsing.
+// Policy and TxHash are hex strings (not []byte) for proper JSON serialization.
 type TokenHolderEvent struct {
 	EventType string `json:"EventType"` // "balance_increased", "balance_decreased"
-	Policy    []byte `json:"Policy"`
-	Name      string `json:"Name"`
+	Policy    string `json:"Policy"`    // Hex-encoded policy ID
+	Name      string `json:"Name"`      // Hex-encoded asset name
 	Address   string `json:"Address"`
 	OldAmount uint64 `json:"OldAmount"`
 	NewAmount uint64 `json:"NewAmount"`
-	TxHash    []byte `json:"TxHash"`
+	TxHash    string `json:"TxHash"` // Hex-encoded tx hash
 	Slot      uint64 `json:"Slot"`
 }

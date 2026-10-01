@@ -21,6 +21,7 @@ type AssetProcessor struct {
 	db              *gorm.DB
 	multiAssetCache *MultiAssetCache
 	errorCollector  *ErrorCollector
+	quiet           bool
 }
 
 // MultiAssetCache manages multi-asset lookups
@@ -107,6 +108,10 @@ func NewAssetProcessor(db *gorm.DB) *AssetProcessor {
 	}
 }
 
+func (ap *AssetProcessor) SetQuiet(quiet bool) {
+	ap.quiet = quiet
+}
+
 // ProcessTransactionMints processes minting operations from a transaction
 func (ap *AssetProcessor) ProcessTransactionMints(ctx context.Context, tx *gorm.DB, txHash []byte, transaction interface{}) error {
 	// Try to extract mints using interface assertion
@@ -119,7 +124,9 @@ func (ap *AssetProcessor) ProcessTransactionMints(ctx context.Context, tx *gorm.
 			return nil
 		}
 
-		log.Printf("Processing minting operations for transaction %x", txHash)
+		if !ap.quiet {
+			log.Printf("Processing minting operations for transaction %x", txHash)
+		}
 
 		// Process each policy in the mint
 		for _, policyID := range mint.Policies() {
@@ -167,10 +174,12 @@ func (ap *AssetProcessor) processMintOperation(tx *gorm.DB, txHash []byte, polic
 		}
 	}
 
-	log.Printf("[OK] Processed mint: policy=%s, asset=%s, amount=%d",
-		hex.EncodeToString(policyID)[:8]+"...",
-		string(assetName),
-		amount)
+	if !ap.quiet {
+		log.Printf("[OK] Processed mint: policy=%s, asset=%s, amount=%d",
+			hex.EncodeToString(policyID)[:8]+"...",
+			string(assetName),
+			amount)
+	}
 
 	return nil
 }
@@ -227,7 +236,7 @@ func (ap *AssetProcessor) processOutputAsset(tx *gorm.DB, txHash []byte, outputI
 func (ap *AssetProcessor) ProcessTransactionAssetsBatch(ctx context.Context, tx *gorm.DB, txHash []byte, transaction ledger.Transaction, outputs []ledger.TransactionOutput) error {
 	// Performance logging - track optimization benefits
 	outputCount := len(outputs)
-	if outputCount > 0 {
+	if outputCount > 0 && !ap.quiet {
 		log.Printf("OPTIMIZED: Processing %d outputs with single batch query (saved %d individual queries)", outputCount, outputCount-1)
 	}
 
@@ -248,7 +257,7 @@ func (ap *AssetProcessor) ProcessTransactionAssetsBatch(ctx context.Context, tx 
 		assetsProcessed++
 	}
 
-	if assetsProcessed > 0 {
+	if assetsProcessed > 0 && !ap.quiet {
 		log.Printf("[OK] Batch processed assets for %d/%d outputs in transaction %s", assetsProcessed, outputCount, hex.EncodeToString(txHash)[:16])
 	}
 
@@ -285,7 +294,7 @@ func (ap *AssetProcessor) ProcessOutputAssetsBatch(ctx context.Context, tx *gorm
 			}
 		}
 
-		if assetCount > 0 {
+		if assetCount > 0 && !ap.quiet {
 			log.Printf(" Processed %d assets in output %d (tx %s) using batch optimization", assetCount, outputIndex, hex.EncodeToString(txHash)[:16])
 		}
 
@@ -396,7 +405,9 @@ func (ap *AssetProcessor) ProcessMint(tx *gorm.DB, txHash []byte, mint map[strin
 		return nil
 	}
 
-	log.Printf("Processing %d mint operations for transaction %x", len(mint), txHash)
+	if !ap.quiet {
+		log.Printf("Processing %d mint operations for transaction %x", len(mint), txHash)
+	}
 
 	for assetID, amount := range mint {
 		// Parse asset ID to get policy and name

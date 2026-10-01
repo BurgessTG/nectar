@@ -2,11 +2,33 @@
 
 **Date**: June 27, 2025  
 **Issue**: Datums are not being stored in the database despite outputs having datum hashes  
-**Severity**: High - Missing critical smart contract data
+**Severity**: Historical high-severity issue; active code now includes a witness-datum path
+
+## Current-State Update (May 26, 2026)
+
+The original root cause below has been addressed in active code. The current
+`ScriptProcessor` implements `ProcessWitnessDatums`, calls it for Alonzo+
+transactions when a witness set exists, and still processes Babbage+ inline
+datums from outputs.
+
+Remaining caveats:
+
+- This document's SQL counts are a historical database snapshot, not current
+  runtime evidence.
+- Runtime correctness still depends on `BlockProcessor` running with
+  `cfg.Scripts == true`, the ledger transaction exposing the witness set, and a
+  database schema that includes the `data` table.
+- A historical backfill may still be needed for blocks indexed before this code
+  existed.
+- `txes.script_size` is still not populated by active code.
 
 ## Executive Summary
 
-The Nectar indexer is correctly storing datum hashes in transaction outputs but is NOT storing the actual datum values in the `data` table. This is because the ScriptProcessor is missing the implementation to process datums from the witness set's `PlutusData` field.
+Historical finding: Nectar was storing datum hashes in transaction outputs but
+was not storing the actual datum values in the `data` table because
+`ScriptProcessor` did not process witness-set `PlutusData`. Current active code
+does include that method and call path; the rest of this document is retained as
+history of the bug.
 
 ## Current State
 
@@ -24,15 +46,15 @@ The Nectar indexer is correctly storing datum hashes in transaction outputs but 
 - ✅ Collateral inputs are being tracked
 
 ### What's Missing
-- ❌ Actual datum values are not being stored in the `data` table
-- ❌ No processing of witness set's `PlutusData` field
-- ❌ `script_size` field is not being populated
+- Historical: actual witness datum values were not being stored in the `data` table
+- Historical: witness set `PlutusData` was not processed
+- Current: `script_size` field is still not being populated
 
 ## Root Cause Analysis
 
 ### 1. Code Flow Analysis
 
-The current processing flow in `ScriptProcessor.ProcessTransaction()`:
+The historical processing flow in `ScriptProcessor.ProcessTransaction()` was:
 
 ```go
 // Line 679-707 in script_processor.go
@@ -47,8 +69,7 @@ if witnessSet != nil {
         return fmt.Errorf("failed to process redeemers: %w", err)
     }
     
-    // MISSING: Process datums from witness set ❌
-    // Should be here: sp.ProcessWitnessDatums(...)
+    // Historical gap: ProcessWitnessDatums was missing here.
 }
 
 // Process inline datums from outputs (Babbage+) ✅
@@ -58,6 +79,9 @@ if blockType >= 6 { // BlockTypeBabbage
     }
 }
 ```
+
+Current active code now calls `sp.ProcessWitnessDatums(...)` after
+`ProcessRedeemers(...)` for Alonzo+ transactions.
 
 ### 2. Available Data Structure
 
@@ -76,12 +100,12 @@ func (w AlonzoTransactionWitnessSet) PlutusData() []cbor.Value {
 }
 ```
 
-### 3. Missing Implementation
+### 3. Historical Missing Implementation
 
-The ScriptProcessor needs a method to process witness datums:
+At the time of this report, the ScriptProcessor needed a method to process witness datums:
 
 ```go
-// This method is MISSING and needs to be implemented
+// Historical proposal; active code now has ProcessWitnessDatums.
 func (sp *ScriptProcessor) ProcessWitnessDatums(ctx context.Context, tx *gorm.DB, txHash []byte, witnessSet interface{}) error {
     switch ws := witnessSet.(type) {
     case interface{ PlutusData() []cbor.Value }:
@@ -155,12 +179,12 @@ SELECT COUNT(*) FROM tx_outs WHERE data_hash IS NOT NULL; -- 780
 SELECT COUNT(*) FROM data; -- 0
 ```
 
-## Recommended Solution
+## Historical Recommended Solution
 
-### Implementation Steps
+### Historical Implementation Steps
 
-1. **Add ProcessWitnessDatums method** to ScriptProcessor
-2. **Call it from ProcessTransaction** after processing redeemers
+1. **Add ProcessWitnessDatums method** to ScriptProcessor (done in active code)
+2. **Call it from ProcessTransaction** after processing redeemers (done in active code)
 3. **Test with known transactions** that have datums
 4. **Consider historical data** - may need a migration script
 
@@ -194,6 +218,10 @@ Since Nectar has already processed blocks with datums:
 
 ## Conclusion
 
-This is a critical missing feature in the ScriptProcessor. The infrastructure is in place (datum cache, data table, etc.) but the actual processing of witness set datums was never implemented. This explains why we see 0 entries in the data table despite having 780 outputs with datum hashes.
+This was a critical missing feature in the ScriptProcessor. Active code now has
+the witness-datum processing path, so the old conclusion should not be used as a
+current bug report without re-running database verification.
 
-The fix is straightforward - implement the missing ProcessWitnessDatums method and call it during transaction processing for Alonzo+ blocks.
+The remaining operational question is whether historical gaps need a backfill
+and whether live runs prove the expected `data` rows for known Alonzo+
+transactions.

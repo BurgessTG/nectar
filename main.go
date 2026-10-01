@@ -29,6 +29,7 @@ import (
 	"nectar/dashboard"
 	"nectar/database"
 	"nectar/errors"
+	"nectar/events"
 	"nectar/metadata"
 	"nectar/models"
 	"nectar/processors"
@@ -91,6 +92,14 @@ func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
 		if duration, err := time.ParseDuration(value); err == nil {
 			return duration
 		}
+	}
+	return defaultValue
+}
+
+// getEnvOrDefault gets a string from environment or returns default
+func getEnvOrDefault(key string, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
 	return defaultValue
 }
@@ -265,6 +274,9 @@ type ReferenceAlignedIndexer struct {
 
 	// State query service for ledger state data
 	stateQueryService *statequery.Service
+
+	// Event bus for real-time updates to backend services
+	eventBus *events.EventBus
 
 	// Dashboard interface - supports multiple dashboard types
 	dashboard          dashboard.Dashboard
@@ -539,6 +551,12 @@ func printHelp() {
 	fmt.Println("  nectar [flags]                    Run the indexer")
 	fmt.Println("  nectar init [flags]               Initialize a new configuration file")
 	fmt.Println("  nectar migrate-env [flags]        Migrate environment variables to config file")
+	fmt.Println("  nectar bootstrap-dolos [flags]    Inspect Dolos/Mithril state, write config, and generate runbooks")
+	fmt.Println("  nectar snapshot-import [flags]    Import current UTxOs from Dolos UTxO RPC/NDJSON or inspect filesystem snapshots")
+	fmt.Println("  nectar history-import [flags]     Import full historical blocks from Dolos DumpHistory into Nectar SQL")
+	fmt.Println("  nectar verify-history [flags]     Verify historical base tables, required indexes, and import completion")
+	fmt.Println("  nectar rebuild-products [flags]   Rebuild Honeycomb product tables from indexed base tables")
+	fmt.Println("  nectar verify-products [flags]    Verify Honeycomb product counts and consistency")
 	fmt.Println("  nectar version                    Show version information")
 	fmt.Println("  nectar help                       Show this help message")
 	fmt.Println()
@@ -555,6 +573,46 @@ func printHelp() {
 	fmt.Println()
 	fmt.Println("  # Migrate existing environment variables to config")
 	fmt.Println("  nectar migrate-env --config production.toml")
+	fmt.Println()
+	fmt.Println("  # Prepare Nectar config from a Mithril-bootstrapped Dolos directory")
+	fmt.Println("  nectar bootstrap-dolos --dolos-dir /path/to/cardano.nodes --config nectar.toml --write")
+	fmt.Println()
+	fmt.Println("  # Generate a reviewable Dolos/MySQL/Nectar bootstrap script")
+	fmt.Println("  nectar bootstrap-dolos --dolos-dir /path/to/cardano.nodes --write-script bootstrap.sh")
+	fmt.Println()
+	fmt.Println("  # Generate snapshot table coverage manifest without connecting to Dolos RPC")
+	fmt.Println("  nectar snapshot-import --manifest-only --write-manifest snapshot-manifest.json")
+	fmt.Println()
+	fmt.Println("  # Filtered UTxO RPC check for a specific policy")
+	fmt.Println("  nectar snapshot-import --dolos-dir /path/to/cardano.nodes --policy <policy_hex> --limit 1000")
+	fmt.Println()
+	fmt.Println("  # Inspect an extracted Mithril filesystem snapshot without writing SQL")
+	fmt.Println("  nectar snapshot-import --source filesystem --snapshot-dir /path/to/extracted-snapshot")
+	fmt.Println()
+	fmt.Println("  # Apply Dingo-compatible UTxO-HD tables/tvar into Nectar tables")
+	fmt.Println("  nectar snapshot-import --source filesystem --snapshot-dir /path/to/extracted-snapshot --apply --replace-utxo")
+	fmt.Println()
+	fmt.Println("  # Import a parsed Dingo-style current UTxO NDJSON file")
+	fmt.Println("  nectar snapshot-import --source ndjson --utxo-ndjson current-utxo.ndjson --apply --replace-utxo")
+	fmt.Println()
+	fmt.Println("  # Dry-run historical Dolos archive decoding")
+	fmt.Println("  nectar history-import --endpoint localhost:50051 --limit 100")
+	fmt.Println()
+	fmt.Println("  # Apply full Dolos archive history into Nectar SQL")
+	fmt.Println("  nectar history-import --config nectar.toml --endpoint localhost:50051 --apply")
+	fmt.Println()
+	fmt.Println("  # Check historical import progress")
+	fmt.Println("  nectar history-import --config nectar.toml --status")
+	fmt.Println()
+	fmt.Println("  # Verify base history tables, indexes, and deep relational integrity")
+	fmt.Println("  nectar verify-history --config nectar.toml --deep --require-complete")
+	fmt.Println()
+	fmt.Println("  # Verify base history is complete and close to the current Dolos tip")
+	fmt.Println("  nectar verify-history --config nectar.toml --deep --require-complete --require-tip --endpoint localhost:50051")
+	fmt.Println()
+	fmt.Println("  # Verify product table counts and reconcile product tables against base rows")
+	fmt.Println("  nectar verify-products --config nectar.toml --deep")
+	fmt.Println()
 }
 
 // rotateLogFiles rotates large log files on startup
@@ -582,6 +640,38 @@ func rotateLogFiles() {
 	}
 }
 
+func databaseConfigFromNectarConfig(cfg *config.Config) database.ConnectionConfig {
+	return database.ConnectionConfig{
+		Driver:          cfg.Database.Driver,
+		DSN:             cfg.Database.DSN,
+		ConnectionPool:  cfg.Database.ConnectionPool,
+		MaxIdleConns:    cfg.Database.MaxIdleConns,
+		MaxOpenConns:    cfg.Database.MaxOpenConns,
+		ConnMaxLifetime: cfg.Database.ConnMaxLifetime,
+	}
+}
+
+func applyRuntimeEnv(cfg *config.Config) {
+	if cfg.Database.DSN != "" {
+		os.Setenv("TIDB_DSN", cfg.Database.DSN)
+		os.Setenv("NECTAR_DSN", cfg.Database.DSN)
+	}
+	os.Setenv("NECTAR_DB_DRIVER", cfg.Database.Driver)
+
+	if !cfg.Dashboard.Enabled {
+		os.Setenv("NECTAR_NO_DASHBOARD", "true")
+	}
+	os.Setenv("DASHBOARD_TYPE", cfg.Dashboard.Type)
+	os.Setenv("WEB_PORT", fmt.Sprintf("%d", cfg.Dashboard.WebPort))
+
+	if cfg.Cardano.NetworkMagic > 0 {
+		os.Setenv("CARDANO_NETWORK_MAGIC", fmt.Sprintf("%d", cfg.Cardano.NetworkMagic))
+	}
+	if cfg.Monitoring.LogLevel != "" {
+		os.Setenv("LOG_LEVEL", cfg.Monitoring.LogLevel)
+	}
+}
+
 func main() {
 	// Handle subcommands first
 	if len(os.Args) > 1 {
@@ -591,6 +681,24 @@ func main() {
 			return
 		case "migrate-env":
 			config.HandleMigrateEnvCommand()
+			return
+		case "bootstrap-dolos":
+			handleBootstrapDolosCommand(os.Args[2:])
+			return
+		case "snapshot-import":
+			handleSnapshotImportCommand(os.Args[2:])
+			return
+		case "history-import":
+			handleHistoryImportCommand(os.Args[2:])
+			return
+		case "verify-history":
+			handleVerifyHistoryCommand(os.Args[2:])
+			return
+		case "rebuild-products":
+			handleRebuildProductsCommand(os.Args[2:])
+			return
+		case "verify-products":
+			handleVerifyProductsCommand(os.Args[2:])
 			return
 		case "version", "-v", "--version":
 			fmt.Println("Nectar v1.0.0")
@@ -649,7 +757,9 @@ func main() {
 	log.Printf("[CONFIG]   Fetch range: %d", activeConfig.FetchRange)
 
 	// Log indexing configuration (selective indexing)
+	log.Printf("[CONFIG] Database driver: %s", cfg.Database.Driver)
 	log.Printf("[CONFIG] Indexing configuration:")
+	log.Printf("[CONFIG]   Profile: %s", cfg.Indexing.Profile)
 	log.Printf("[CONFIG]   Core: transactions=%t, blocks=%t", cfg.Indexing.Transactions, cfg.Indexing.Blocks)
 	log.Printf("[CONFIG]   Token features: metadata=%t, assets=%t, minting=%t",
 		cfg.Indexing.Metadata, cfg.Indexing.Assets, cfg.Indexing.Minting)
@@ -671,27 +781,8 @@ func main() {
 	BULK_MODE_ENABLED = cfg.Performance.BulkModeEnabled
 	DefaultCardanoNodeSocket = cfg.Cardano.NodeSocket
 
-	// Also set environment variables for backward compatibility
-	if cfg.Database.DSN != "" {
-		os.Setenv("TIDB_DSN", cfg.Database.DSN)
-		os.Setenv("NECTAR_DSN", cfg.Database.DSN)
-	}
-
-	if !cfg.Dashboard.Enabled {
-		os.Setenv("NECTAR_NO_DASHBOARD", "true")
-	}
-	os.Setenv("DASHBOARD_TYPE", cfg.Dashboard.Type)
-	os.Setenv("WEB_PORT", fmt.Sprintf("%d", cfg.Dashboard.WebPort))
-
-	// Set network magic
-	if cfg.Cardano.NetworkMagic > 0 {
-		os.Setenv("CARDANO_NETWORK_MAGIC", fmt.Sprintf("%d", cfg.Cardano.NetworkMagic))
-	}
-
-	// Set monitoring settings
-	if cfg.Monitoring.LogLevel != "" {
-		os.Setenv("LOG_LEVEL", cfg.Monitoring.LogLevel)
-	}
+	// Also set environment variables for backward compatibility.
+	applyRuntimeEnv(cfg)
 
 	// Log configuration summary
 	log.Printf("Configuration loaded from: %s", configPath)
@@ -730,14 +821,14 @@ func main() {
 
 	if os.Getenv("SKIP_MIGRATIONS") != "true" {
 		log.Println("Running database migrations...")
-		db, err := database.InitTiDB()
+		db, err := database.InitSQL(databaseConfigFromNectarConfig(cfg))
 		if err != nil {
 			// Restore output for fatal error
 			log.SetOutput(originalOutput)
 			log.Fatalf("Failed to initialize database: %v", err)
 		}
 
-		if err := database.AutoMigrate(db); err != nil {
+		if err := database.AutoMigrateForDriver(db, cfg.Database.Driver); err != nil {
 			// Restore output for fatal error
 			log.SetOutput(originalOutput)
 			log.Fatalf("Failed to run migrations: %v", err)
@@ -745,7 +836,7 @@ func main() {
 		log.Println("Database migrations completed!")
 	}
 
-	db, err := database.InitTiDB()
+	db, err := database.InitSQL(databaseConfigFromNectarConfig(cfg))
 	if err != nil {
 		// Restore output for fatal error
 		log.SetOutput(originalOutput)
@@ -932,6 +1023,7 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 
 	// Create connection pool manager with dedicated connections for each worker
 	poolConfig := database.GetDefaultConnectionPoolConfig()
+	poolConfig.Driver = cfg.Database.Driver
 	poolConfig.WorkerCount = WORKER_COUNT
 
 	connPoolManager, err := database.NewConnectionPoolManager(poolConfig)
@@ -942,20 +1034,30 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 	// Store the connection pool manager
 	indexer.connPoolManager = connPoolManager
 
-	// Create block processors with dedicated connections
+	// Create and start the event bus for real-time updates to backend
+	eventBusAddr := getEnvOrDefault("EVENT_BUS_ADDRESS", "0.0.0.0:9000")
+	indexer.eventBus = events.NewEventBus(10000) // Buffer size for events
+	go func() {
+		if err := indexer.eventBus.Start(eventBusAddr); err != nil {
+			log.Printf("[EVENT_BUS] Failed to start event bus on %s: %v", eventBusAddr, err)
+		}
+	}()
+
+	// Create block processors with dedicated connections and event channel
+	eventChan := indexer.eventBus.GetEventChannel()
 	for i := 0; i < WORKER_COUNT; i++ {
 		dbConn, err := connPoolManager.GetConnection(i)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get connection for worker %d: %w", i, err)
 		}
-		processor := processors.NewBlockProcessor(dbConn, &cfg.Indexing)
+		processor := processors.NewBlockProcessorWithEvents(dbConn, &cfg.Indexing, eventChan)
 		indexer.dbConnections = append(indexer.dbConnections, processor)
 	}
 
 	// Initialize metadata fetcher for off-chain data with a dedicated connection
 	if indexer.connPoolManager != nil && cfg.Metadata.Enabled {
 		// Create a dedicated connection for metadata fetcher
-		metadataDB, err := database.InitTiDB()
+		metadataDB, err := database.InitSQL(databaseConfigFromNectarConfig(cfg))
 		if err != nil {
 			// Will be captured by log buffer
 		} else {
@@ -971,8 +1073,8 @@ func NewReferenceAlignedIndexer(db *gorm.DB, cfg *config.Config) (*ReferenceAlig
 	}
 
 	// Initialize state query service with another dedicated connection
-	if indexer.connPoolManager != nil {
-		stateQueryDB, err := database.InitTiDB()
+	if indexer.connPoolManager != nil && cfg.StateQuery.Enabled {
+		stateQueryDB, err := database.InitSQL(databaseConfigFromNectarConfig(cfg))
 		if err != nil {
 			// Will be captured by log buffer
 		} else {
@@ -1185,8 +1287,8 @@ func (rai *ReferenceAlignedIndexer) Start() error {
 	// Use 8 workers to balance with TiDB cluster resource usage
 	rai.blockWorkers = WORKER_COUNT
 	// Larger queue to reduce backpressure frequency
-	rai.blockQueue = make(chan blockQueueItem, 10000)
-	rai.logToActivity("system", fmt.Sprintf("Initializing %d block processing workers with queue capacity %d", rai.blockWorkers, 10000))
+	rai.blockQueue = make(chan blockQueueItem, 2000)
+	rai.logToActivity("system", fmt.Sprintf("Initializing %d block processing workers with queue capacity %d", rai.blockWorkers, 2000))
 	rai.startBlockWorkers()
 
 	// Start ChainSync
@@ -1341,6 +1443,15 @@ func (rai *ReferenceAlignedIndexer) chainSyncRollBackwardHandler(
 
 		rai.logToActivity("rollback", fmt.Sprintf("Found rollback target: block hash %x at slot %d", targetBlock.Hash[:8], point.Slot))
 
+		rollbackSlot := *targetBlock.SlotNo
+
+		// Phase 1: Capture affected data BEFORE cascade delete
+		var rollbackData *processors.RollbackData
+		rollbackData, err = rai.dbConnections[0].CaptureRollbackData(tx, rollbackSlot)
+		if err != nil {
+			log.Printf("[ROLLBACK] Warning: Failed to capture rollback data: %v", err)
+		}
+
 		// Delete all blocks after the target block
 		// This will cascade to transactions and related data due to foreign keys
 		result := tx.Where("slot_no > ?", targetBlock.SlotNo).Delete(&models.Block{})
@@ -1349,6 +1460,11 @@ func (rai *ReferenceAlignedIndexer) chainSyncRollBackwardHandler(
 		}
 
 		rai.logToActivity("rollback", fmt.Sprintf("Deleted %d blocks after rollback point", result.RowsAffected))
+
+		// Phase 2: Clean up derived tables AFTER cascade delete
+		if rollbackData != nil {
+			rai.dbConnections[0].HandleRollback(tx, rollbackSlot, rollbackData)
+		}
 
 		// Also clean up any orphaned data that might not have cascade deletes
 		if err := rai.cleanupOrphanedData(tx, targetBlock.Hash); err != nil {
@@ -1640,7 +1756,7 @@ func (rai *ReferenceAlignedIndexer) startReferenceChainSync() error {
 		return fmt.Errorf("failed to build intersection points: %w", err)
 	}
 
-	// DEBUG: Print intersection points to stdout (bypass dashboard logging)
+	// DEBUG: Intersection logging enabled for debugging sync resume issues
 	fmt.Fprintf(os.Stdout, "[DEBUG] Requesting intersection with %d point(s):\n", len(startPoints))
 	for i, point := range startPoints {
 		if point.Slot == 0 && len(point.Hash) == 0 {
@@ -1869,10 +1985,12 @@ func (rai *ReferenceAlignedIndexer) updateEraProgress(currentSlot uint64) {
 	}
 	rai.dashboard.UpdateEraProgress("Babbage", babbageProgress)
 
-	// Conway
+	// Conway (started slot 133660800, tip ~174092562)
 	conwayProgress := 0.0
-	if currentSlot >= 133660800 {
-		conwayProgress = 5.0 // Early stage
+	if currentSlot >= 174092562 {
+		conwayProgress = 100.0
+	} else if currentSlot >= 133660800 {
+		conwayProgress = ((float64(currentSlot) - 133660800) / (174092562 - 133660800)) * 100
 	}
 	rai.dashboard.UpdateEraProgress("Conway", conwayProgress)
 }
@@ -2006,6 +2124,12 @@ func (rai *ReferenceAlignedIndexer) Shutdown() {
 	}
 	rai.connMutex.Unlock()
 
+	// Stop event bus
+	if rai.eventBus != nil {
+		rai.logToActivity("system", "Stopping event bus...")
+		rai.eventBus.Stop()
+	}
+
 	// Clean up dashboard
 	if rai.dashboard != nil {
 		rai.dashboard.Stop()
@@ -2018,8 +2142,8 @@ func (rai *ReferenceAlignedIndexer) Shutdown() {
 func (rai *ReferenceAlignedIndexer) startConnectionWatchdog() {
 	go func() {
 		// Configuration for stall detection
-		const stallThreshold = 60 * time.Second  // Consider stalled if no blocks for 60s
-		const checkInterval = 10 * time.Second   // Check every 10 seconds
+		const stallThreshold = 60 * time.Second // Consider stalled if no blocks for 60s
+		const checkInterval = 10 * time.Second  // Check every 10 seconds
 		const maxReconnectAttempts = 5
 		const baseReconnectDelay = 5 * time.Second
 
@@ -2173,6 +2297,16 @@ func (rai *ReferenceAlignedIndexer) handleConnectionError(errorType, message str
 
 // performFullRollback rolls back all blocks after a given slot
 func (rai *ReferenceAlignedIndexer) performFullRollback(tx *gorm.DB, slot uint64) error {
+	// Phase 1: Capture affected data BEFORE cascade delete
+	var rollbackData *processors.RollbackData
+	if len(rai.dbConnections) > 0 {
+		var err error
+		rollbackData, err = rai.dbConnections[0].CaptureRollbackData(tx, slot)
+		if err != nil {
+			log.Printf("[ROLLBACK] Warning: Failed to capture rollback data: %v", err)
+		}
+	}
+
 	// Delete all blocks after the given slot
 	result := tx.Where("slot_no > ?", slot).Delete(&models.Block{})
 	if result.Error != nil {
@@ -2183,6 +2317,12 @@ func (rai *ReferenceAlignedIndexer) performFullRollback(tx *gorm.DB, slot uint64
 	if rai != nil {
 		rai.logToActivity("rollback", fmt.Sprintf("Full rollback: deleted %d blocks after slot %d", result.RowsAffected, slot))
 	}
+
+	// Phase 2: Clean up derived tables AFTER cascade delete
+	if len(rai.dbConnections) > 0 && rollbackData != nil {
+		rai.dbConnections[0].HandleRollback(tx, slot, rollbackData)
+	}
+
 	return nil
 }
 
@@ -2317,6 +2457,8 @@ func (rai *ReferenceAlignedIndexer) getCPUUsage() string {
 func (rai *ReferenceAlignedIndexer) getLastProcessedSlot() (uint64, error) {
 	var lastSlot sql.NullInt64
 
+	fmt.Fprintf(os.Stdout, "[DEBUG] getLastProcessedSlot: querying blocks table...\n")
+
 	// Find the highest slot number using ORDER BY LIMIT 1 (faster index scan than MAX)
 	err := rai.dbConnections[0].GetDB().Model(&models.Block{}).
 		Select("slot_no").
@@ -2325,33 +2467,45 @@ func (rai *ReferenceAlignedIndexer) getLastProcessedSlot() (uint64, error) {
 		Scan(&lastSlot).Error
 
 	if err != nil {
+		fmt.Fprintf(os.Stdout, "[DEBUG] getLastProcessedSlot: query error: %v\n", err)
 		return 0, fmt.Errorf("failed to get last processed slot: %w", err)
 	}
 
+	fmt.Fprintf(os.Stdout, "[DEBUG] getLastProcessedSlot: query result - Valid=%v, Int64=%d\n", lastSlot.Valid, lastSlot.Int64)
+
 	if !lastSlot.Valid {
 		// No blocks in database, start from genesis
+		fmt.Fprintf(os.Stdout, "[DEBUG] getLastProcessedSlot: NULL result, returning 0\n")
 		return 0, nil
 	}
 
 	// Add conservative safety margin for rollback protection
 	safetyMargin := uint64(20) // Increased from 10 for better safety
 	if uint64(lastSlot.Int64) <= safetyMargin {
+		fmt.Fprintf(os.Stdout, "[DEBUG] getLastProcessedSlot: slot %d <= safety margin %d, returning 0\n", lastSlot.Int64, safetyMargin)
 		return 0, nil
 	}
 
-	return uint64(lastSlot.Int64) - safetyMargin, nil
+	result := uint64(lastSlot.Int64) - safetyMargin
+	fmt.Fprintf(os.Stdout, "[DEBUG] getLastProcessedSlot: returning %d (raw=%d - margin=%d)\n", result, lastSlot.Int64, safetyMargin)
+	return result, nil
 }
 
 func (rai *ReferenceAlignedIndexer) buildIntersectionPoints() ([]common.Point, error) {
 	// Get the last processed slot from database
+	fmt.Fprintf(os.Stdout, "[DEBUG] buildIntersectionPoints: querying database for last processed slot...\n")
 	lastSlot, err := rai.getLastProcessedSlot()
 	if err != nil {
+		fmt.Fprintf(os.Stdout, "[DEBUG] buildIntersectionPoints: ERROR getting last slot: %v\n", err)
 		rai.logToActivity("sync", fmt.Sprintf("Could not get last processed slot, starting from node tip: %v", err))
 		// Return empty array to start from tip
 		return []common.Point{}, nil
 	}
 
+	fmt.Fprintf(os.Stdout, "[DEBUG] buildIntersectionPoints: lastSlot = %d\n", lastSlot)
+
 	if lastSlot == 0 {
+		fmt.Fprintf(os.Stdout, "[DEBUG] buildIntersectionPoints: lastSlot is 0, starting fresh\n")
 		rai.logToActivity("sync", "Starting fresh sync from node's current tip (no previous blocks found)")
 		rai.logToActivity("sync", "Will sync all new blocks from this point forward")
 		// Return empty array to start from tip
@@ -2372,39 +2526,60 @@ func (rai *ReferenceAlignedIndexer) buildIntersectionPoints() ([]common.Point, e
 		rai.logToActivity("sync", fmt.Sprintf("Skipping ~%d already-processed blocks - instant startup!", blocksSkipped))
 	}
 
-	// SAFE RESUMPTION: Get most recent block that definitely exists
-	var resumeBlock models.Block
+	// SAFE RESUMPTION: Get multiple recent blocks at various depths
+	// This handles small reorgs - ChainSync tries each point in order
 	var points []common.Point
 
-	// Strategy: Find the most recent block we definitely have
-	// Using explicit column selection and index hint for faster query
-	err = rai.dbConnections[0].GetDB().Model(&models.Block{}).
-		Select("hash, slot_no, block_no, epoch_no").
-		Order("slot_no DESC").
-		Limit(1).
-		First(&resumeBlock).Error
-	if err == nil {
-		// SUCCESS: We have the actual latest block to resume from
-		point := common.NewPoint(*resumeBlock.SlotNo, resumeBlock.Hash)
-		points = append(points, point)
-		rai.logToActivity("sync", fmt.Sprintf("RESUMING from latest block: slot %d, hash %x", *resumeBlock.SlotNo, resumeBlock.Hash[:8]))
+	fmt.Fprintf(os.Stdout, "[DEBUG] buildIntersectionPoints: looking up multiple blocks for robust resume...\n")
 
-		// Verify this makes sense (should be close to our calculated lastSlot)
-		slotDiff := int64(*resumeBlock.SlotNo) - int64(lastSlot)
-		if slotDiff > 100 || slotDiff < -100 {
-			errors.Get().ProcessingError("Sync", "ResumeVerify",
-				fmt.Errorf("resume slot %d differs from calculated %d by %d slots", *resumeBlock.SlotNo, lastSlot, slotDiff))
+	// Query multiple blocks at different depths for reorg resilience
+	// Depths: latest, -100 slots, -1000 slots, -10000 slots, -100000 slots
+	depths := []uint64{0, 100, 1000, 10000, 100000}
+
+	for _, depth := range depths {
+		targetSlot := lastSlot
+		if depth > 0 {
+			if lastSlot > depth {
+				targetSlot = lastSlot - depth
+			} else {
+				continue // Skip if we don't have blocks that far back
+			}
 		}
-	} else {
-		// SAFE FALLBACK: Only use era intersection if we have NO blocks at all
-		errors.Get().ProcessingError("Sync", "FindBlocks", fmt.Errorf("could not find any blocks in database: %w", err))
+
+		var block models.Block
+		err = rai.dbConnections[0].GetDB().Model(&models.Block{}).
+			Select("hash, slot_no, block_no, epoch_no").
+			Where("slot_no <= ?", targetSlot).
+			Order("slot_no DESC").
+			Limit(1).
+			First(&block).Error
+
+		if err == nil && block.SlotNo != nil {
+			point := common.NewPoint(*block.SlotNo, block.Hash)
+			points = append(points, point)
+			fmt.Fprintf(os.Stdout, "[DEBUG] buildIntersectionPoints: added point at depth %d - slot=%d, hash=%x\n",
+				depth, *block.SlotNo, block.Hash[:8])
+
+			if depth == 0 {
+				rai.logToActivity("sync", fmt.Sprintf("RESUMING from slot %d (with %d fallback points)", *block.SlotNo, len(depths)-1))
+			}
+		}
+	}
+
+	if len(points) == 0 {
+		// No blocks found at all
+		fmt.Fprintf(os.Stdout, "[DEBUG] buildIntersectionPoints: ERROR - no blocks found in database\n")
+		errors.Get().ProcessingError("Sync", "FindBlocks", fmt.Errorf("could not find any blocks in database"))
 		rai.logToActivity("sync", "Starting fresh sync from genesis")
 		points = append(points, common.NewPointOrigin())
 		return points, nil
 	}
 
-	// Add genesis as final fallback
+	// Add genesis as final fallback (but we have many points before this now)
+	fmt.Fprintf(os.Stdout, "[DEBUG] buildIntersectionPoints: adding genesis as final fallback\n")
 	points = append(points, common.NewPointOrigin())
 
+	fmt.Fprintf(os.Stdout, "[DEBUG] buildIntersectionPoints: returning %d intersection points\n", len(points))
+	rai.logToActivity("sync", fmt.Sprintf("Prepared %d intersection points for ChainSync", len(points)))
 	return points, nil
 }

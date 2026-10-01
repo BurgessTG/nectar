@@ -3,11 +3,34 @@
 **Date**: June 27, 2025  
 **Auditor**: Professional Code Audit  
 **Overall Rating**: 7.5/10  
-**Status**: Production-Ready with Recommendations
+**Status**: Historical snapshot, not a current production-readiness verdict
+
+## Current-State Caveat (May 26, 2026)
+
+This report is useful as an older audit record, but several claims below no
+longer match the active Go code:
+
+- `BlockProcessor` is constructed as `NewBlockProcessor(db, cfg)` or
+  `NewBlockProcessorWithEvents(db, cfg, eventChan)`, not as a config-free
+  constructor.
+- The active transaction path wires assets, metadata, scripts, collateral,
+  reference inputs, wallet connections, token holders, and token transfers.
+  Certificate, withdrawal, and governance processors exist in the package, but
+  they are not fields or calls in the main `BlockProcessor` transaction path.
+- `txSemaphore` is currently 16, and the default database/worker counts are 8.
+- Unit tests exist under `indexer/tests/unit`; `go test ./...` passes in the
+  current audit, but coverage was not measured.
+- `ScriptProcessor` now processes redeemers, witness datums, and Babbage inline
+  datums. Reference script extraction and `txes.script_size` population are
+  still not active.
+- Token transfer indexing is wired into `BlockProcessor`, and
+  `token_wallet_connections` startup creation is now owned by manual DDL in
+  `database/migration_helper.go`. Historical backend SQL/backfill DDL still
+  duplicate that schema, and token transfer event-bus publication is not wired.
 
 ## Executive Summary
 
-This document presents a comprehensive audit of the Nectar blockchain indexer's processor components. The audit evaluates code quality, architecture, performance, security, and completeness of implementation. While the codebase demonstrates solid engineering practices and is production-ready for basic indexing operations, several areas require improvement for enterprise-grade deployment.
+This document presents a historical audit of the Nectar blockchain indexer's processor components. It should not be used as the current source of truth without checking the active code and `docs/CURRENT_STATE_AUDIT.md`.
 
 ## Table of Contents
 
@@ -45,8 +68,8 @@ The audit evaluated each processor component against the following criteria:
 
 #### Weaknesses
 - **File Size**: At 1,651 lines, violates single responsibility principle
-- **Configuration**: Hardcoded values (e.g., `txSemaphore: 32`) should be configurable
-- **Testing**: No unit tests found in the codebase
+- **Configuration**: Some processor knobs remain hardcoded; active `txSemaphore` is 16
+- **Testing**: Unit tests now exist under `indexer/tests/unit`; `go test ./...` passes, but coverage was not measured
 - **Documentation**: Missing godoc comments for many public methods
 
 #### Code Example - Good Practice
@@ -76,8 +99,8 @@ func (bp *BlockProcessor) updateEraConfig(epochNo uint32) {
 - **Proper Hashing**: Uses Blake2b-256 for script hashes
 
 #### Weaknesses
-- **Library Limitations**: Cannot access redeemers due to gouroboros constraints
-- **Missing Features**: Reference scripts and script size tracking not implemented
+- **Redeemer Follow-Through**: Redeemers are now read and stored, but script-data hash, script linking, and fee fields remain incomplete
+- **Missing Features**: Reference script extraction still returns nil due gouroboros interface limits, and script size tracking is not populated
 - **Validation**: No script syntax or size validation
 - **The Bug**: Critical logic error (now fixed) that prevented script indexing
 
@@ -103,6 +126,10 @@ if witnessSet != nil {
 ### 3. CertificateProcessor (Rating: 8.5/10)
 
 **File**: `processors/certificate_processor.go`
+
+Current wiring caveat: this processor exists and contains certificate handling
+logic, but the active `BlockProcessor` transaction path does not currently hold
+or call a `CertificateProcessor`.
 
 #### Strengths
 - **Complete Coverage**: Supports all 18 certificate types including Conway governance
@@ -159,6 +186,10 @@ if witnessSet != nil {
 - **Integration**: No connection to reward calculation system
 
 ### 7. GovernanceProcessor (Rating: 6/10)
+
+Current wiring caveat: package code for voting procedures, proposal
+procedures, and governance certificates exists, but the active
+`BlockProcessor` transaction path does not currently call it.
 
 **File**: `processors/governance_processor.go`
 
@@ -238,8 +269,8 @@ func NewRateLimiter(rps int) *RateLimiter {
 
 1. **Block Processing**: 50-100 blocks/second
 2. **Memory Usage**: ~1GB after optimizations
-3. **Database Connections**: 64 max connections
-4. **Batch Sizes**: Era-aware (Byron: 5000, Alonzo: 1000)
+3. **Database Connections**: current defaults are 8 max/open connections unless overridden
+4. **Batch Sizes**: Era-aware batching exists, but live throughput should be measured from the current binary and database
 
 ### Bottlenecks Identified
 
@@ -307,7 +338,15 @@ func (bp *BlockProcessor) processTransactionsParallel(txs []Transaction) error {
        
        for _, tt := range tests {
            t.Run(tt.name, func(t *testing.T) {
-               bp := NewBlockProcessor(mockDB())
+               cfg := &config.IndexingConfig{
+                   Transactions: true,
+                   Blocks: true,
+                   Inputs: true,
+                   Outputs: true,
+                   Scripts: true,
+                   Collateral: true,
+               }
+               bp := NewBlockProcessor(mockDB(), cfg)
                err := bp.ProcessBlock(context.Background(), tt.block, 0)
                if (err != nil) != tt.wantErr {
                    t.Errorf("ProcessBlock() error = %v, wantErr %v", err, tt.wantErr)
@@ -339,7 +378,7 @@ func (bp *BlockProcessor) processTransactionsParallel(txs []Transaction) error {
    )
    ```
 
-3. **Add Configuration Management**
+3. **Audit Configuration Coverage**
    ```yaml
    # config.yaml
    processors:
@@ -364,10 +403,10 @@ func (bp *BlockProcessor) processTransactionsParallel(txs []Transaction) error {
    - Extract transaction processing logic
    - Create separate era handlers
 
-2. **Implement Missing Features**
-   - Complete governance processor
-   - Add redeemer processing when library supports
-   - Implement reference script handling
+2. **Implement or Wire Missing Features**
+   - Wire and verify governance, certificate, and withdrawal processors in the active transaction path
+   - Harden redeemer processing by linking script data hash, script hash, execution fee, and validation coverage
+   - Implement reference script handling once the ledger interface exposes script refs
 
 3. **Enhance Validation**
    - Add schema validation for metadata
@@ -391,7 +430,7 @@ func (bp *BlockProcessor) processTransactionsParallel(txs []Transaction) error {
 ### Phase 1: Foundation (Weeks 1-4)
 - [ ] Add unit tests for all processors (40% coverage minimum)
 - [ ] Implement Prometheus metrics
-- [ ] Add configuration file support
+- [ ] Audit remaining hardcoded processor settings against the current TOML config
 - [ ] Fix unbounded cache issues
 
 ### Phase 2: Security (Weeks 5-8)
@@ -407,14 +446,14 @@ func (bp *BlockProcessor) processTransactionsParallel(txs []Transaction) error {
 - [ ] Load testing and benchmarking
 
 ### Phase 4: Features (Weeks 13-24)
-- [ ] Complete governance processor
+- [ ] Wire and verify governance processor in the active block path
 - [ ] Add metadata standards support
 - [ ] Implement missing script features
 - [ ] Add advanced querying APIs
 
 ## Conclusion
 
-The Nectar processor codebase demonstrates solid engineering fundamentals and is suitable for production use in its current state. The architecture is well-designed with good separation of concerns and era-aware processing. However, to achieve enterprise-grade quality, the recommendations in this audit should be implemented, particularly around testing, monitoring, and security.
+This historical audit captured useful processor concerns, but its original production-readiness conclusion is stale. The current source of truth is the active Go code plus the current-state audit; several processor packages exist without being wired into the live transaction path, and derived-table migration ownership still needs cleanup.
 
 The most critical issue (script processing bug) has been resolved, and with the proposed improvements, Nectar can become a best-in-class blockchain indexer for the Cardano ecosystem.
 
@@ -422,7 +461,7 @@ The most critical issue (script processing bug) has been resolved, and with the 
 
 ```
 Total Lines of Code: ~5,000
-Test Coverage: 0% (needs improvement)
+Test Coverage: unit tests exist, but current coverage was not established by this report
 Cyclomatic Complexity: Medium (some functions > 10)
 Technical Debt Ratio: 15% (acceptable)
 Duplication: Low (<5%)

@@ -1,24 +1,43 @@
 # Nectar Implementation Guide
 
-This guide provides actionable steps to implement the recommendations from the processor audit report.
+This guide is a historical roadmap paired with the older processor audit report.
+It is not a current implementation manual. Many examples below predate the
+current `config.Config`/`config.IndexingConfig` types, the
+`NewBlockProcessor(db, cfg)` constructor, the existing unit-test tree, and the
+active `nectar.toml` loader. Treat snippets as design notes unless they have
+been rechecked against the current Go code.
+
+Current code reality:
+
+- Run commands from `indexer/`, not `/root/workspace/cardano-stack/Nectar`.
+- Configuration file support already exists through `nectar.toml`,
+  `config.Load`, `init`, `migrate-env`, `--config`, and `-c`.
+- Unit tests already exist under `indexer/tests/unit`; `go test ./...` passes
+  in the current audit, although coverage is still not measured.
+- `BlockProcessor` currently wires assets, metadata, scripts, collateral,
+  reference inputs, wallet connections, token holders, and token transfers.
+  Certificate, withdrawal, and governance processors exist but are not in the
+  active transaction path.
+- Prometheus-style monitoring is not an indexer-wide current contract from this
+  document; verify actual runtime metrics before documenting it as deployed.
 
 ## Quick Start Checklist
 
 - [ ] Run `go mod tidy` to fix module dependencies
-- [ ] Add unit tests (target 40% coverage in Phase 1)
-- [ ] Implement configuration file support
+- [ ] Fix and run existing unit tests (target 40% coverage in Phase 1)
+- [ ] Audit current configuration coverage for remaining hardcoded settings
 - [ ] Add Prometheus metrics
 - [ ] Fix unbounded caches
 - [ ] Add input validation
 - [ ] Refactor large files
-- [ ] Complete stub implementations
+- [ ] Wire package processors that are implemented but not active
 
 ## Phase 1: Foundation (Weeks 1-4)
 
 ### 1.1 Fix Module Dependencies
 
 ```bash
-cd /root/workspace/cardano-stack/Nectar
+cd indexer
 go mod tidy
 ```
 
@@ -76,7 +95,18 @@ func TestBlockProcessor_ProcessBlock(t *testing.T) {
     for _, tt := range tests {
         t.Run(tt.name, func(t *testing.T) {
             db := setupTestDB(t)
-            bp := NewBlockProcessor(db)
+            bp := NewBlockProcessor(db, &config.IndexingConfig{
+                Transactions: true,
+                Blocks: true,
+                Metadata: true,
+                Assets: true,
+                Minting: true,
+                UTXOs: true,
+                Inputs: true,
+                Outputs: true,
+                Scripts: true,
+                Collateral: true,
+            })
             
             // Create mock block
             block := createMockBlock(tt.blockType)
@@ -116,9 +146,13 @@ func TestScriptProcessor_ProcessTransactionScripts(t *testing.T) {
 }
 ```
 
-### 1.3 Implement Configuration Support
+### 1.3 Audit Configuration Support
 
-Create configuration structure:
+Current status: TOML configuration support exists. The active task is to check
+which processor knobs are still hardcoded or inconsistently applied, not to add
+configuration support from scratch.
+
+Historical proposal:
 
 ```go
 // config/config.go
@@ -180,7 +214,8 @@ func LoadConfig(path string) (*Config, error) {
 }
 ```
 
-Update processors to use configuration:
+Historical proposal; current `BlockProcessor` already receives
+`*config.IndexingConfig`, but does not match the constructor below:
 
 ```go
 // processors/block_processor.go
@@ -189,11 +224,11 @@ func NewBlockProcessor(db *gorm.DB, config *config.BlockProcessorConfig) *BlockP
         db:                   db,
         stakeAddressCache:    NewStakeAddressCache(db),
         errorCollector:       GetGlobalErrorCollector(),
-        certificateProcessor: NewCertificateProcessor(db, stakeAddressCache),
-        withdrawalProcessor:  NewWithdrawalProcessor(db),
+        certificateProcessor: NewCertificateProcessor(db, stakeAddressCache), // not active current field
+        withdrawalProcessor:  NewWithdrawalProcessor(db),                     // not active current field
         assetProcessor:       NewAssetProcessor(db),
         metadataProcessor:    NewMetadataProcessor(db),
-        governanceProcessor:  NewGovernanceProcessor(db),
+        governanceProcessor:  NewGovernanceProcessor(db),                     // not active current field
         scriptProcessor:      NewScriptProcessor(db, config.Script),
         adaPotsCalculator:    NewAdaPotsCalculator(db),
         epochParamsProvider:  NewEpochParamsProvider(db),
@@ -619,7 +654,12 @@ func (wp *WorkerPool) worker(ctx context.Context) {
 
 ## Phase 4: Features (Weeks 13-24)
 
-### 4.1 Complete Governance Processor
+### 4.1 Wire and Verify Governance Processor
+
+Current status: governance package code exists, including voting/proposal and
+certificate-related methods. The active gap is live `BlockProcessor` wiring,
+schema/runtime verification, and tests; the examples below are historical
+design snippets.
 
 ```go
 // processors/governance_processor.go

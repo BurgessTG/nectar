@@ -87,6 +87,13 @@ coverage.html
 # Test artifacts
 test-results/
 
+# Local import/backfill runtime state
+/run/
+/scripts/backfill_work/
+
+# External database-volume symlink
+/tidb-data
+
 # Local development overrides
 docker-compose.override.yml
 docker-compose.local.yml 

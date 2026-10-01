@@ -205,6 +205,62 @@ func createTablesWithCompositeKeys(db *gorm.DB) error {
 				INDEX idx_wc_last_slot (last_tx_slot)
 			)`,
 		},
+		{
+			name: "token_holders",
+			sql: `CREATE TABLE IF NOT EXISTS token_holders (
+				policy VARBINARY(28) NOT NULL,
+				name VARBINARY(32) NOT NULL,
+				address VARCHAR(256) NOT NULL,
+				amount BIGINT UNSIGNED NOT NULL,
+				tx_hash VARBINARY(32),
+				output_index INT UNSIGNED,
+				stake_address VARCHAR(63),
+				last_updated_slot BIGINT UNSIGNED,
+				PRIMARY KEY (policy, name, address),
+				INDEX idx_token_holders_amount (policy, name, amount DESC),
+				INDEX idx_token_holders_stake_address (stake_address),
+				INDEX idx_token_holders_last_updated (last_updated_slot)
+			)`,
+		},
+		{
+			name: "token_wallet_connections",
+			sql: `CREATE TABLE IF NOT EXISTS token_wallet_connections (
+				tx_hash VARBINARY(32) NOT NULL,
+				tx_index INT UNSIGNED NOT NULL,
+				policy_id VARBINARY(28) NOT NULL,
+				asset_name VARBINARY(32) NOT NULL,
+				from_address VARCHAR(256) NOT NULL,
+				to_address VARCHAR(256) NOT NULL,
+				from_stake_address VARCHAR(63),
+				to_stake_address VARCHAR(63),
+				quantity BIGINT UNSIGNED NOT NULL,
+				slot BIGINT UNSIGNED NOT NULL,
+				block_height BIGINT UNSIGNED,
+				PRIMARY KEY (tx_hash, tx_index, policy_id, asset_name, from_address, to_address),
+				INDEX idx_twc_token (policy_id, asset_name, slot DESC),
+				INDEX idx_twc_from (from_address, policy_id, asset_name),
+				INDEX idx_twc_to (to_address, policy_id, asset_name),
+				INDEX idx_twc_stake_pair (from_stake_address, to_stake_address, policy_id, asset_name),
+				INDEX idx_twc_slot (slot DESC)
+			)`,
+		},
+		{
+			name: "token_metadata",
+			sql: `CREATE TABLE IF NOT EXISTS token_metadata (
+				policy_id VARCHAR(56) NOT NULL,
+				asset_name VARCHAR(64) NOT NULL,
+				name VARCHAR(255),
+				ticker VARCHAR(32),
+				description TEXT,
+				url VARCHAR(512),
+				decimals INT UNSIGNED DEFAULT 0,
+				logo MEDIUMTEXT,
+				raw_json JSON,
+				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+				PRIMARY KEY (policy_id, asset_name),
+				INDEX idx_token_metadata_lookup (policy_id, asset_name)
+			)`,
+		},
 	}
 
 	for _, table := range compositePKTables {
@@ -214,6 +270,38 @@ func createTablesWithCompositeKeys(db *gorm.DB) error {
 		}
 	}
 
+	if err := ensureTokenWalletConnectionPrimaryKey(db); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func ensureTokenWalletConnectionPrimaryKey(db *gorm.DB) error {
+	var keyColumnCount int64
+	if err := db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.key_column_usage
+		WHERE table_schema = DATABASE()
+		  AND table_name = 'token_wallet_connections'
+		  AND constraint_name = 'PRIMARY'
+		  AND column_name IN ('from_address', 'to_address')
+	`).Scan(&keyColumnCount).Error; err != nil {
+		log.Printf("WARNING: Could not inspect token_wallet_connections primary key: %v", err)
+		return nil
+	}
+	if keyColumnCount == 2 {
+		return nil
+	}
+
+	log.Println("Migrating token_wallet_connections primary key to include sender/receiver addresses")
+	if err := db.Exec(`
+		ALTER TABLE token_wallet_connections
+		DROP PRIMARY KEY,
+		ADD PRIMARY KEY (tx_hash, tx_index, policy_id, asset_name, from_address, to_address)
+	`).Error; err != nil {
+		return fmt.Errorf("failed to migrate token_wallet_connections primary key: %w", err)
+	}
 	return nil
 }
 
@@ -312,11 +400,11 @@ func migrateModelsWithoutCompositeKeys(db *gorm.DB) error {
 // CreateTiFlashReplicas creates TiFlash replicas for analytical queries
 func CreateTiFlashReplicas(db *gorm.DB) error {
 	log.Println("Creating TiFlash replicas for analytical queries...")
-	
+
 	// Main tables that benefit from TiFlash for analytics
 	tiflashTables := []string{
 		"blocks",
-		"txes", 
+		"txes",
 		"tx_outs",
 		"tx_ins",
 		"multi_assets",
@@ -329,7 +417,7 @@ func CreateTiFlashReplicas(db *gorm.DB) error {
 		"stake_addresses",
 		"pool_updates",
 	}
-	
+
 	for _, table := range tiflashTables {
 		sql := fmt.Sprintf("ALTER TABLE %s SET TIFLASH REPLICA 1", table)
 		if err := db.Exec(sql).Error; err != nil {
@@ -339,9 +427,9 @@ func CreateTiFlashReplicas(db *gorm.DB) error {
 			log.Printf("Created TiFlash replica for table: %s", table)
 		}
 	}
-	
+
 	// Wait a moment for replicas to start syncing
 	log.Println("TiFlash replicas created. They will sync in the background.")
-	
+
 	return nil
 }

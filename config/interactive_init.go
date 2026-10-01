@@ -45,7 +45,7 @@ func InteractiveInit(configPath string) error {
 	fmt.Println("  3) Preview")
 	fmt.Println("  4) Custom")
 	fmt.Print("Choice [1]: ")
-	
+
 	networkChoice, _ := reader.ReadString('\n')
 	networkChoice = strings.TrimSpace(networkChoice)
 	if networkChoice == "" {
@@ -89,8 +89,19 @@ func InteractiveInit(configPath string) error {
 	// Database Configuration
 	fmt.Println("\n💾 Database Configuration")
 	fmt.Println("------------------------")
-	fmt.Println("Enter your TiDB connection details.")
-	
+	fmt.Println("Enter your MySQL-compatible database connection details.")
+
+	fmt.Print("Database driver [mysql]: ")
+	dbDriver, _ := reader.ReadString('\n')
+	dbDriver = strings.TrimSpace(strings.ToLower(dbDriver))
+	if dbDriver == "" {
+		dbDriver = DatabaseDriverMySQL
+	}
+	if dbDriver != DatabaseDriverMySQL && dbDriver != DatabaseDriverTiDB {
+		return fmt.Errorf("invalid database driver: %s", dbDriver)
+	}
+	cfg.Database.Driver = dbDriver
+
 	fmt.Print("Database host [localhost]: ")
 	dbHost, _ := reader.ReadString('\n')
 	dbHost = strings.TrimSpace(dbHost)
@@ -98,11 +109,15 @@ func InteractiveInit(configPath string) error {
 		dbHost = "localhost"
 	}
 
-	fmt.Print("Database port [4000]: ")
+	defaultPort := "3306"
+	if cfg.Database.Driver == DatabaseDriverTiDB {
+		defaultPort = "4000"
+	}
+	fmt.Printf("Database port [%s]: ", defaultPort)
 	dbPort, _ := reader.ReadString('\n')
 	dbPort = strings.TrimSpace(dbPort)
 	if dbPort == "" {
-		dbPort = "4000"
+		dbPort = defaultPort
 	}
 
 	fmt.Print("Database name [nectar]: ")
@@ -130,7 +145,7 @@ func InteractiveInit(configPath string) error {
 	// Performance Configuration
 	fmt.Println("\n⚡ Performance Configuration")
 	fmt.Println("---------------------------")
-	
+
 	fmt.Print("Number of worker threads [8]: ")
 	workersStr, _ := reader.ReadString('\n')
 	workersStr = strings.TrimSpace(workersStr)
@@ -168,7 +183,7 @@ func InteractiveInit(configPath string) error {
 	fmt.Println("  3) Both")
 	fmt.Println("  4) None")
 	fmt.Print("Choice [1]: ")
-	
+
 	dashChoice, _ := reader.ReadString('\n')
 	dashChoice = strings.TrimSpace(dashChoice)
 	if dashChoice == "" {
@@ -230,7 +245,7 @@ func InteractiveInit(configPath string) error {
 
 	cfg.Performance.BulkModeEnabled = false
 	cfg.Performance.BulkFetchRangeSize = 2000
-	cfg.Performance.StatsInterval = 3000000000      // 3s in nanoseconds
+	cfg.Performance.StatsInterval = 3000000000 // 3s in nanoseconds
 	cfg.Performance.BlockQueueSize = 10000
 
 	cfg.Dashboard.DetailedLog = false
@@ -252,8 +267,26 @@ func InteractiveInit(configPath string) error {
 	}
 
 	cfg.StateQuery = StateQueryConfig{
-		Enabled:    true,
+		Enabled:    false,
 		SocketPath: "", // Uses cardano.node_socket
+	}
+
+	cfg.Indexing = IndexingConfig{
+		Profile:           IndexingProfileHoneycomb,
+		Transactions:      true,
+		Blocks:            true,
+		Metadata:          true,
+		Assets:            true,
+		Minting:           true,
+		UTXOs:             false,
+		Inputs:            true,
+		Outputs:           true,
+		Certificates:      false,
+		Governance:        false,
+		Withdrawals:       false,
+		Scripts:           false,
+		Collateral:        false,
+		WalletConnections: true,
 	}
 
 	// Generate config file
@@ -278,7 +311,7 @@ func InteractiveInit(configPath string) error {
 	}
 
 	fmt.Printf("\n✅ Configuration saved to: %s\n", configPath)
-	
+
 	// Show summary
 	fmt.Println("\n📋 Configuration Summary")
 	fmt.Println("------------------------")

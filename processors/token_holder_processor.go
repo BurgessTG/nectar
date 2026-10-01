@@ -62,6 +62,12 @@ func (thp *TokenHolderProcessor) ProcessTransaction(tx *gorm.DB, txHash []byte, 
 
 		// For each token in the spent UTxO, record a DECREASE
 		for _, token := range spentTokens {
+			decrease, err := quantityToSignedDelta(token.Quantity)
+			if err != nil {
+				return fmt.Errorf("spent token quantity out of range for holder delta: policy=%x name=%x quantity=%d: %w",
+					token.Policy, token.Name, token.Quantity, err)
+			}
+
 			key := makeHolderKey(token.Policy, token.Name, spentOut.Address)
 			if _, exists := balanceChanges[key]; !exists {
 				balanceChanges[key] = &holderChange{
@@ -72,7 +78,10 @@ func (thp *TokenHolderProcessor) ProcessTransaction(tx *gorm.DB, txHash []byte, 
 					delta:        0,
 				}
 			}
-			balanceChanges[key].delta -= int64(token.Quantity)
+			if err := addHolderDelta(balanceChanges[key], -decrease); err != nil {
+				return fmt.Errorf("failed to apply spent token delta: policy=%x name=%x address=%s: %w",
+					token.Policy, token.Name, spentOut.Address, err)
+			}
 		}
 	}
 
@@ -112,6 +121,11 @@ func (thp *TokenHolderProcessor) ProcessTransaction(tx *gorm.DB, txHash []byte, 
 				if amount == 0 {
 					continue
 				}
+				increase, err := quantityToSignedDelta(uint64(amount))
+				if err != nil {
+					return fmt.Errorf("output token quantity out of range for holder delta: policy=%x name=%x quantity=%d: %w",
+						policyIDBytes, assetNameBytes, amount, err)
+				}
 
 				key := makeHolderKey(policyIDBytes, assetNameBytes, addressStr)
 				if _, exists := balanceChanges[key]; !exists {
@@ -125,7 +139,10 @@ func (thp *TokenHolderProcessor) ProcessTransaction(tx *gorm.DB, txHash []byte, 
 						outputIndex:  uint32(i),
 					}
 				}
-				balanceChanges[key].delta += int64(amount)
+				if err := addHolderDelta(balanceChanges[key], increase); err != nil {
+					return fmt.Errorf("failed to apply output token delta: policy=%x name=%x address=%s: %w",
+						policyIDBytes, assetNameBytes, addressStr, err)
+				}
 				balanceChanges[key].txHash = txHash
 				balanceChanges[key].outputIndex = uint32(i)
 			}
@@ -149,6 +166,29 @@ type holderChange struct {
 	delta        int64 // Can be negative (spending) or positive (receiving)
 	txHash       []byte
 	outputIndex  uint32
+}
+
+const (
+	maxHolderDelta = int64(^uint64(0) >> 1)
+	minHolderDelta = -maxHolderDelta - 1
+)
+
+func quantityToSignedDelta(quantity uint64) (int64, error) {
+	if quantity > uint64(maxHolderDelta) {
+		return 0, fmt.Errorf("quantity exceeds max signed delta %d", maxHolderDelta)
+	}
+	return int64(quantity), nil
+}
+
+func addHolderDelta(change *holderChange, delta int64) error {
+	if delta > 0 && change.delta > maxHolderDelta-delta {
+		return fmt.Errorf("holder delta overflow")
+	}
+	if delta < 0 && change.delta < minHolderDelta-delta {
+		return fmt.Errorf("holder delta underflow")
+	}
+	change.delta += delta
+	return nil
 }
 
 // makeHolderKey creates a unique key for a holder
@@ -216,11 +256,11 @@ func (thp *TokenHolderProcessor) upsertIncreases(tx *gorm.DB, increases []*holde
 		// Emit event if channel is configured (non-blocking)
 		thp.emitEvent(models.TokenHolderEvent{
 			EventType: "balance_increased",
-			Policy:    inc.policy,
-			Name:      hex.EncodeToString(inc.name), // Hex encode binary name
+			Policy:    hex.EncodeToString(inc.policy),
+			Name:      hex.EncodeToString(inc.name),
 			Address:   inc.address,
 			NewAmount: uint64(inc.delta),
-			TxHash:    inc.txHash,
+			TxHash:    hex.EncodeToString(inc.txHash),
 			Slot:      slotNo,
 		})
 	}
@@ -228,21 +268,22 @@ func (thp *TokenHolderProcessor) upsertIncreases(tx *gorm.DB, increases []*holde
 	// Race condition protection: Only update if new slot >= existing slot.
 	// This ensures live sync (higher slots) takes precedence over backfill (lower slots)
 	// when both are writing to the same holder.
+	// COALESCE handles NULL from backfill data (treats NULL as 0, so live sync always wins).
 	sql := fmt.Sprintf(`
 		INSERT INTO token_holders
 			(policy, name, address, amount, tx_hash, output_index, stake_address, last_updated_slot)
 		VALUES %s
 		ON DUPLICATE KEY UPDATE
-			amount = CASE WHEN VALUES(last_updated_slot) >= last_updated_slot
+			amount = CASE WHEN VALUES(last_updated_slot) >= COALESCE(last_updated_slot, 0)
 			              THEN amount + VALUES(amount)
 			              ELSE amount END,
-			tx_hash = CASE WHEN VALUES(last_updated_slot) >= last_updated_slot
+			tx_hash = CASE WHEN VALUES(last_updated_slot) >= COALESCE(last_updated_slot, 0)
 			               THEN VALUES(tx_hash)
 			               ELSE tx_hash END,
-			output_index = CASE WHEN VALUES(last_updated_slot) >= last_updated_slot
+			output_index = CASE WHEN VALUES(last_updated_slot) >= COALESCE(last_updated_slot, 0)
 			                    THEN VALUES(output_index)
 			                    ELSE output_index END,
-			last_updated_slot = CASE WHEN VALUES(last_updated_slot) >= last_updated_slot
+			last_updated_slot = CASE WHEN VALUES(last_updated_slot) >= COALESCE(last_updated_slot, 0)
 			                         THEN VALUES(last_updated_slot)
 			                         ELSE last_updated_slot END
 	`, strings.Join(valueStrings, ","))
@@ -260,15 +301,16 @@ func (thp *TokenHolderProcessor) applyDecreases(tx *gorm.DB, decreases []*holder
 
 		// Race condition protection: Only decrease if new slot >= existing slot.
 		// This prevents backfill from overwriting live sync updates.
+		// COALESCE handles NULL from backfill data (treats NULL as 0, so live sync always wins).
 		result := tx.Exec(`
 			UPDATE token_holders
 			SET amount = CASE
-				WHEN ? >= last_updated_slot AND amount >= ? THEN amount - ?
-				WHEN ? >= last_updated_slot THEN 0
+				WHEN ? >= COALESCE(last_updated_slot, 0) AND amount >= ? THEN amount - ?
+				WHEN ? >= COALESCE(last_updated_slot, 0) THEN 0
 				ELSE amount
 			END,
 			last_updated_slot = CASE
-				WHEN ? >= last_updated_slot THEN ?
+				WHEN ? >= COALESCE(last_updated_slot, 0) THEN ?
 				ELSE last_updated_slot
 			END
 			WHERE policy = ? AND name = ? AND address = ?
@@ -288,11 +330,11 @@ func (thp *TokenHolderProcessor) applyDecreases(tx *gorm.DB, decreases []*holder
 		// Emit event if channel is configured (non-blocking)
 		thp.emitEvent(models.TokenHolderEvent{
 			EventType: "balance_decreased",
-			Policy:    dec.policy,
-			Name:      hex.EncodeToString(dec.name), // Hex encode binary name
+			Policy:    hex.EncodeToString(dec.policy),
+			Name:      hex.EncodeToString(dec.name),
 			Address:   dec.address,
 			OldAmount: decreaseAmount,
-			TxHash:    dec.txHash,
+			TxHash:    hex.EncodeToString(dec.txHash),
 			Slot:      slotNo,
 		})
 	}
@@ -359,6 +401,152 @@ func (thp *TokenHolderProcessor) deriveStakeAddressFromAddr(addr ledger.Address)
 	stakeCredHash := addrBytes[29:57]
 	hexStr := hex.EncodeToString(stakeCredHash)
 	return "stake_" + hexStr
+}
+
+// AffectedHolder identifies a token holder that may need recalculation after rollback
+type AffectedHolder struct {
+	Policy  []byte
+	Name    []byte
+	Address string
+}
+
+// CaptureAffectedHolders finds all holders that may have been affected by blocks after rollbackSlot.
+// Must be called BEFORE cascade-deleting blocks, while evidence still exists.
+func (thp *TokenHolderProcessor) CaptureAffectedHolders(tx *gorm.DB, rollbackSlot uint64) ([]AffectedHolder, error) {
+	seen := make(map[string]bool)
+	var affected []AffectedHolder
+
+	addUnique := func(policy, name []byte, address string) {
+		key := makeHolderKey(policy, name, address)
+		if !seen[key] {
+			seen[key] = true
+			affected = append(affected, AffectedHolder{
+				Policy:  append([]byte{}, policy...),
+				Name:    append([]byte{}, name...),
+				Address: address,
+			})
+		}
+	}
+
+	// Query 1: Holders who received tokens in rolled-back blocks (outputs)
+	var outputHolders []struct {
+		Policy  []byte
+		Name    []byte
+		Address string
+	}
+	err := tx.Raw(`
+		SELECT DISTINCT ma.policy, ma.name, txo.address
+		FROM ma_tx_outs ma
+		JOIN tx_outs txo ON txo.tx_hash = ma.tx_hash AND txo.`+"`index`"+` = ma.tx_index
+		JOIN txes t ON t.hash = ma.tx_hash
+		JOIN blocks b ON b.hash = t.block_hash
+		WHERE b.slot_no > ?
+	`, rollbackSlot).Scan(&outputHolders).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to capture output holders: %w", err)
+	}
+	for _, h := range outputHolders {
+		addUnique(h.Policy, h.Name, h.Address)
+	}
+
+	// Query 2: Holders whose tokens were spent in rolled-back blocks (inputs)
+	var inputHolders []struct {
+		Policy  []byte
+		Name    []byte
+		Address string
+	}
+	err = tx.Raw(`
+		SELECT DISTINCT ma.policy, ma.name, txo.address
+		FROM tx_ins ti
+		JOIN tx_outs txo ON txo.tx_hash = ti.tx_out_hash AND txo.`+"`index`"+` = ti.tx_out_index
+		JOIN ma_tx_outs ma ON ma.tx_hash = ti.tx_out_hash AND ma.tx_index = ti.tx_out_index
+		JOIN txes t ON t.hash = ti.tx_in_hash
+		JOIN blocks b ON b.hash = t.block_hash
+		WHERE b.slot_no > ?
+	`, rollbackSlot).Scan(&inputHolders).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to capture input holders: %w", err)
+	}
+	for _, h := range inputHolders {
+		addUnique(h.Policy, h.Name, h.Address)
+	}
+
+	// Query 3: Safety net — holders whose last_updated_slot is after rollback point
+	var staleHolders []struct {
+		Policy  []byte
+		Name    []byte
+		Address string
+	}
+	err = tx.Raw(`
+		SELECT policy, name, address
+		FROM token_holders
+		WHERE last_updated_slot > ?
+	`, rollbackSlot).Scan(&staleHolders).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to capture stale holders: %w", err)
+	}
+	for _, h := range staleHolders {
+		addUnique(h.Policy, h.Name, h.Address)
+	}
+
+	log.Printf("[TOKEN_HOLDER] Rollback: captured %d affected holders (outputs=%d, inputs=%d, stale=%d)",
+		len(affected), len(outputHolders), len(inputHolders), len(staleHolders))
+
+	return affected, nil
+}
+
+// RecalculateAfterRollback recalculates balances for affected holders from the remaining UTXO set.
+// Must be called AFTER cascade-deleting blocks.
+func (thp *TokenHolderProcessor) RecalculateAfterRollback(tx *gorm.DB, affected []AffectedHolder, rollbackSlot uint64) error {
+	if len(affected) == 0 {
+		return nil
+	}
+
+	recalculated := 0
+	deleted := 0
+
+	for _, holder := range affected {
+		var result struct {
+			Balance uint64
+			TxHash  []byte
+			TxIndex uint32
+		}
+		err := tx.Raw(`
+			SELECT COALESCE(SUM(ma.quantity), 0) AS balance,
+			       MAX(ma.tx_hash) AS tx_hash,
+			       MAX(ma.tx_index) AS tx_index
+			FROM ma_tx_outs ma
+			JOIN tx_outs txo ON txo.tx_hash = ma.tx_hash AND txo.`+"`index`"+` = ma.tx_index
+			LEFT JOIN tx_ins ti ON ti.tx_out_hash = ma.tx_hash AND ti.tx_out_index = ma.tx_index
+			WHERE ma.policy = ? AND ma.name = ? AND txo.address = ? AND ti.tx_in_hash IS NULL
+		`, holder.Policy, holder.Name, holder.Address).Scan(&result).Error
+		if err != nil {
+			log.Printf("[TOKEN_HOLDER] Warning: Failed to recalculate balance for %s: %v", holder.Address, err)
+			continue
+		}
+
+		if result.Balance == 0 {
+			// No remaining balance — delete the holder row
+			tx.Exec(`DELETE FROM token_holders WHERE policy = ? AND name = ? AND address = ?`,
+				holder.Policy, holder.Name, holder.Address)
+			deleted++
+		} else {
+			// Upsert with recalculated balance
+			tx.Exec(`
+				INSERT INTO token_holders (policy, name, address, amount, tx_hash, output_index, stake_address, last_updated_slot)
+				VALUES (?, ?, ?, ?, ?, ?, '', ?)
+				ON DUPLICATE KEY UPDATE
+					amount = VALUES(amount),
+					tx_hash = VALUES(tx_hash),
+					output_index = VALUES(output_index),
+					last_updated_slot = VALUES(last_updated_slot)
+			`, holder.Policy, holder.Name, holder.Address, result.Balance, result.TxHash, result.TxIndex, rollbackSlot)
+			recalculated++
+		}
+	}
+
+	log.Printf("[TOKEN_HOLDER] Rollback complete: recalculated=%d, deleted=%d", recalculated, deleted)
+	return nil
 }
 
 // CleanupZeroBalances removes any holders with zero balance (maintenance task)

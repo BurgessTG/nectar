@@ -1,6 +1,7 @@
 package database
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"os"
@@ -9,12 +10,16 @@ import (
 	"sync"
 	"time"
 
-	"gorm.io/driver/mysql"
+	mysqlDriver "github.com/go-sql-driver/mysql"
+	gormMysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 const (
+	DatabaseDriverMySQL = "mysql"
+	DatabaseDriverTiDB  = "tidb"
+
 	// DefaultTiDBDSN is used only if TIDB_DSN environment variable is not set
 	// In production, always set TIDB_DSN with proper credentials
 	// Note: tx_isolation removed from DSN - set at session level to avoid mid-transaction conflicts
@@ -24,97 +29,174 @@ const (
 	NectarDBDSN = "root:@tcp(127.0.0.1:4000)/nectar?charset=utf8mb4&parseTime=True&loc=Local&timeout=60s&readTimeout=60s&writeTimeout=300s&maxAllowedPacket=67108864&autocommit=true&interpolateParams=true"
 )
 
-// InitTiDB initializes the TiDB connection with optimizations
-func InitTiDB() (*gorm.DB, error) {
-	// Configure MySQL driver with custom error handling
+type ConnectionConfig struct {
+	Driver          string
+	DSN             string
+	ConnectionPool  int
+	MaxIdleConns    int
+	MaxOpenConns    int
+	ConnMaxLifetime time.Duration
+}
+
+func NormalizeDriver(driver string) string {
+	switch strings.ToLower(strings.TrimSpace(driver)) {
+	case "", DatabaseDriverMySQL:
+		return DatabaseDriverMySQL
+	case DatabaseDriverTiDB:
+		return DatabaseDriverTiDB
+	default:
+		return strings.ToLower(strings.TrimSpace(driver))
+	}
+}
+
+func IsTiDBDriver(driver string) bool {
+	return NormalizeDriver(driver) == DatabaseDriverTiDB
+}
+
+func CurrentDriver() string {
+	return NormalizeDriver(os.Getenv("NECTAR_DB_DRIVER"))
+}
+
+// InitSQL initializes a MySQL-compatible connection. TiDB-specific settings are
+// applied only when cfg.Driver is "tidb".
+func InitSQL(cfg ConnectionConfig) (*gorm.DB, error) {
+	driver := NormalizeDriver(cfg.Driver)
+	switch driver {
+	case DatabaseDriverMySQL, DatabaseDriverTiDB:
+	default:
+		return nil, fmt.Errorf("unsupported database driver %q", cfg.Driver)
+	}
+	if cfg.DSN == "" {
+		return nil, fmt.Errorf("database DSN is required")
+	}
+
+	os.Setenv("NECTAR_DB_DRIVER", driver)
 	ConfigureMySQLDriver()
 
-	// Get DSN from environment or use default
-	baseDSN := os.Getenv("TIDB_DSN")
-	if baseDSN == "" {
-		// Log warning if using default DSN
-		log.Println("WARNING: TIDB_DSN not set, using default DSN without password. Set TIDB_DSN in production!")
-		baseDSN = DefaultTiDBDSN
+	if err := ensureDatabaseExists(cfg.DSN); err != nil {
+		log.Printf("Warning: could not pre-create configured database: %v; continuing with configured DSN", err)
 	}
 
-	// First, connect without specifying a database
-	baseDB, err := gorm.Open(mysql.Open(baseDSN), &gorm.Config{
-		Logger: NewGormLogger(),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to TiDB cluster: %w", err)
-	}
-
-	// Create the nectar database if it doesn't exist
-	if err := baseDB.Exec("CREATE DATABASE IF NOT EXISTS nectar").Error; err != nil {
-		return nil, fmt.Errorf("failed to create nectar database: %w", err)
-	}
-
-	// Close the base connection
-	sqlDB, err := baseDB.DB()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get underlying sql.DB: %w", err)
-	}
-	sqlDB.Close()
-
-	// Now connect to the nectar database
-	nectarDSN := os.Getenv("NECTAR_DSN")
-	if nectarDSN == "" {
-		// Try TIDB_DSN as fallback
-		nectarDSN = os.Getenv("TIDB_DSN")
-		if nectarDSN == "" {
-			log.Println("WARNING: NECTAR_DSN not set, using default DSN without password. Set NECTAR_DSN in production!")
-			nectarDSN = NectarDBDSN
-		}
-	}
-
-	db, err := gorm.Open(mysql.Open(nectarDSN), &gorm.Config{
+	db, err := gorm.Open(gormMysql.Open(cfg.DSN), &gorm.Config{
 		Logger:                                   NewGormLogger(),
 		DisableForeignKeyConstraintWhenMigrating: true,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to nectar database: %w", err)
+		return nil, fmt.Errorf("failed to connect to %s database: %w", driver, err)
 	}
 
-	// Get underlying sql.DB to configure connection pool
-	sqlDB, err = db.DB()
+	sqlDB, err := db.DB()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get underlying sql.DB: %w", err)
 	}
 
-	// Configure connection pool for high-performance
-	// Get pool settings from environment or use defaults
-	poolSize := 16 // Default from env
+	configureSQLPool(sqlDB, cfg)
+
+	if err := db.Exec("ROLLBACK").Error; err != nil {
+		// Ignore error - there might not be a transaction
+	}
+
+	if IsTiDBDriver(driver) {
+		if err := enableTiDBOptimizations(db); err != nil {
+			log.Printf("Warning: failed to enable some TiDB optimizations: %v", err)
+		}
+	}
+
+	log.Printf("%s connection established", driver)
+	return db, nil
+}
+
+// InitTiDB initializes the legacy TiDB connection path.
+func InitTiDB() (*gorm.DB, error) {
+	dsn := os.Getenv("NECTAR_DSN")
+	if dsn == "" {
+		dsn = os.Getenv("TIDB_DSN")
+	}
+	if dsn == "" {
+		log.Println("WARNING: NECTAR_DSN/TIDB_DSN not set, using default TiDB DSN without password. Set NECTAR_DSN in production!")
+		dsn = NectarDBDSN
+	}
+
+	poolSize := 16
 	if envPool := os.Getenv("DB_CONNECTION_POOL"); envPool != "" {
-		var size int
-		fmt.Sscanf(envPool, "%d", &size)
-		if size > 0 {
+		if size, err := strconv.Atoi(envPool); err == nil && size > 0 {
 			poolSize = size
 		}
 	}
 
-	// Reduced multipliers to prevent connection exhaustion in Shelley era
-	sqlDB.SetMaxIdleConns(poolSize)     // Same as pool size
-	sqlDB.SetMaxOpenConns(poolSize * 2) // Only 2x pool size for max open
-	sqlDB.SetConnMaxLifetime(30 * time.Minute) // Shorter lifetime to prevent stale connections
-	sqlDB.SetConnMaxIdleTime(10 * time.Minute) // Shorter idle time
+	return InitSQL(ConnectionConfig{
+		Driver:         DatabaseDriverTiDB,
+		DSN:            dsn,
+		ConnectionPool: poolSize,
+	})
+}
 
-	// Ensure no transaction is active before setting session variables
-	if err := db.Exec("ROLLBACK").Error; err != nil {
-		// Ignore error - there might not be a transaction
+func ensureDatabaseExists(dsn string) error {
+	cfg, err := mysqlDriver.ParseDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("failed to parse database DSN: %w", err)
 	}
-	
-	// Enable TiDB-specific optimizations
-	if err := enableTiDBOptimizations(db); err != nil {
-		log.Printf("Warning: failed to enable some TiDB optimizations: %v", err)
+	if cfg.DBName == "" {
+		return fmt.Errorf("database name is required in DSN")
 	}
 
-	log.Println("TiDB connection established with performance optimizations")
-	return db, nil
+	dbName := cfg.DBName
+	cfg.DBName = ""
+	baseDB, err := gorm.Open(gormMysql.Open(cfg.FormatDSN()), &gorm.Config{
+		Logger: NewGormLogger(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to connect without database selected: %w", err)
+	}
+	sqlDB, err := baseDB.DB()
+	if err != nil {
+		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
+	}
+	defer sqlDB.Close()
+
+	if err := baseDB.Exec("CREATE DATABASE IF NOT EXISTS " + quoteIdentifier(dbName)).Error; err != nil {
+		return fmt.Errorf("failed to create database %s: %w", dbName, err)
+	}
+	return nil
+}
+
+func quoteIdentifier(name string) string {
+	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
+}
+
+func configureSQLPool(sqlDB *sql.DB, cfg ConnectionConfig) {
+	poolSize := cfg.ConnectionPool
+	if poolSize <= 0 {
+		poolSize = 8
+	}
+	maxIdle := cfg.MaxIdleConns
+	if maxIdle <= 0 {
+		maxIdle = poolSize
+	}
+	maxOpen := cfg.MaxOpenConns
+	if maxOpen <= 0 {
+		maxOpen = poolSize * 2
+	}
+	lifetime := cfg.ConnMaxLifetime
+	if lifetime <= 0 {
+		lifetime = 30 * time.Minute
+	}
+
+	sqlDB.SetMaxIdleConns(maxIdle)
+	sqlDB.SetMaxOpenConns(maxOpen)
+	sqlDB.SetConnMaxLifetime(lifetime)
+	sqlDB.SetConnMaxIdleTime(10 * time.Minute)
 }
 
 // AutoMigrate runs GORM auto-migration for all models
 func AutoMigrate(db *gorm.DB) error {
+	return AutoMigrateForDriver(db, CurrentDriver())
+}
+
+// AutoMigrateForDriver runs GORM auto-migration for all models and applies
+// TiDB-only features only for the TiDB driver.
+func AutoMigrateForDriver(db *gorm.DB, driver string) error {
+	driver = NormalizeDriver(driver)
 	log.Println("Starting database migrations...")
 
 	// Disable foreign key checks during migration
@@ -132,22 +214,22 @@ func AutoMigrate(db *gorm.DB) error {
 		log.Printf("Warning: could not re-enable foreign key checks: %v", err)
 	}
 
-	// Apply TiDB-specific optimizations after migration
-	if err := applyTiDBOptimizations(db); err != nil {
-		log.Printf("Warning: failed to apply TiDB optimizations: %v", err)
-	}
-	
-	// Create TiFlash replicas for analytical queries
-	if err := CreateTiFlashReplicas(db); err != nil {
-		log.Printf("Warning: failed to create TiFlash replicas: %v", err)
+	if IsTiDBDriver(driver) {
+		if err := applyTiDBOptimizations(db); err != nil {
+			log.Printf("Warning: failed to apply TiDB optimizations: %v", err)
+		}
+
+		if err := CreateTiFlashReplicas(db); err != nil {
+			log.Printf("Warning: failed to create TiFlash replicas: %v", err)
+		}
 	}
 
 	// Create all indexes using unified index manager
 	indexManager := NewUnifiedIndexManager(db)
-	if err := indexManager.CreateAllIndexes(); err != nil {
+	if err := indexManager.CreateAllIndexesForDriver(driver); err != nil {
 		log.Printf("Warning: failed to create indexes: %v", err)
 	}
-	
+
 	// Analyze tables for query optimization
 	if err := indexManager.AnalyzeTables(); err != nil {
 		log.Printf("Warning: failed to analyze tables: %v", err)
@@ -220,8 +302,6 @@ func enableTiDBOptimizations(db *gorm.DB) error {
 	return nil
 }
 
-
-
 // CheckDatabaseConnection verifies the database connection is healthy
 func CheckDatabaseConnection(db *gorm.DB) error {
 	sqlDB, err := db.DB()
@@ -293,12 +373,13 @@ type ConnectionPoolManager struct {
 
 // ConnectionPoolConfig holds configuration for the connection pool
 type ConnectionPoolConfig struct {
-	DSN              string
-	WorkerCount      int
-	MaxIdleConns     int
-	MaxOpenConns     int
-	ConnMaxLifetime  time.Duration
-	ConnMaxIdleTime  time.Duration
+	DSN                 string
+	Driver              string
+	WorkerCount         int
+	MaxIdleConns        int
+	MaxOpenConns        int
+	ConnMaxLifetime     time.Duration
+	ConnMaxIdleTime     time.Duration
 	HealthCheckInterval time.Duration
 }
 
@@ -365,7 +446,7 @@ func (cpm *ConnectionPoolManager) createConnection(workerID int) (*gorm.DB, erro
 		dsnWithWorkerID += fmt.Sprintf("?connectionAttributes=worker_id:%d,pid:%d", workerID, os.Getpid())
 	}
 
-	db, err := gorm.Open(mysql.Open(dsnWithWorkerID), &gorm.Config{
+	db, err := gorm.Open(gormMysql.Open(dsnWithWorkerID), &gorm.Config{
 		Logger:                                   NewGormLogger(),
 		DisableForeignKeyConstraintWhenMigrating: true,
 		SkipDefaultTransaction:                   true,  // Performance optimization
@@ -384,8 +465,8 @@ func (cpm *ConnectionPoolManager) createConnection(workerID int) (*gorm.DB, erro
 
 	// CRITICAL: Disable ALL connection pooling for worker connections
 	// This ensures each worker has exactly ONE dedicated connection
-	sqlDB.SetMaxIdleConns(1) // Exactly 1 connection
-	sqlDB.SetMaxOpenConns(1) // Exactly 1 connection - no pooling!
+	sqlDB.SetMaxIdleConns(1)    // Exactly 1 connection
+	sqlDB.SetMaxOpenConns(1)    // Exactly 1 connection - no pooling!
 	sqlDB.SetConnMaxLifetime(0) // Never expire (we manage lifecycle)
 	sqlDB.SetConnMaxIdleTime(0) // Never idle timeout
 
@@ -393,10 +474,11 @@ func (cpm *ConnectionPoolManager) createConnection(workerID int) (*gorm.DB, erro
 	if err := db.Exec("ROLLBACK").Error; err != nil {
 		// Ignore error - there might not be a transaction
 	}
-	
-	// Enable TiDB-specific optimizations
-	if err := enableTiDBOptimizations(db); err != nil {
-		log.Printf("[WARNING] Worker %d: failed to enable some TiDB optimizations: %v", workerID, err)
+
+	if IsTiDBDriver(cpm.config.Driver) {
+		if err := enableTiDBOptimizations(db); err != nil {
+			log.Printf("[WARNING] Worker %d: failed to enable some TiDB optimizations: %v", workerID, err)
+		}
 	}
 
 	// Set a unique connection ID to help with debugging
@@ -506,6 +588,7 @@ func GetDefaultConnectionPoolConfig() *ConnectionPoolConfig {
 
 	return &ConnectionPoolConfig{
 		DSN:                 dsn,
+		Driver:              CurrentDriver(),
 		WorkerCount:         workerCount,
 		MaxIdleConns:        1, // MUST be 1 for dedicated connections
 		MaxOpenConns:        1, // MUST be 1 to prevent pooling
@@ -533,13 +616,14 @@ func FastCreate(tx *gorm.DB, value interface{}) error {
 func FastCreateInBatches(tx *gorm.DB, value interface{}, batchSize int) error {
 	// Set TiDB optimizations for this operation
 	optimizedTx := tx.Session(&gorm.Session{
-		SkipHooks: true,
+		SkipHooks:   true,
 		PrepareStmt: false,
 	})
-	
-	// Set batch processing hints
-	optimizedTx.Exec("SET SESSION tidb_dml_batch_size = ?", batchSize*2)
-	
+
+	if IsTiDBDriver(CurrentDriver()) {
+		optimizedTx.Exec("SET SESSION tidb_dml_batch_size = ?", batchSize*2)
+	}
+
 	// Try batch create with INSERT IGNORE
 	if err := optimizedTx.Clauses(clause.Insert{Modifier: "IGNORE"}).CreateInBatches(value, batchSize).Error; err != nil {
 		// If it's a duplicate entry error, that's OK

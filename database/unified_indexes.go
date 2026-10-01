@@ -2,6 +2,7 @@ package database
 
 import (
 	"log"
+	"regexp"
 	"strings"
 
 	"gorm.io/gorm"
@@ -19,6 +20,10 @@ func NewUnifiedIndexManager(db *gorm.DB) *UnifiedIndexManager {
 
 // CreateAllIndexes creates all necessary indexes for optimal performance
 func (uim *UnifiedIndexManager) CreateAllIndexes() error {
+	return uim.CreateAllIndexesForDriver(CurrentDriver())
+}
+
+func (uim *UnifiedIndexManager) CreateAllIndexesForDriver(driver string) error {
 	log.Println("[INFO] Creating unified index set...")
 
 	// Group indexes by category for better organization
@@ -34,8 +39,10 @@ func (uim *UnifiedIndexManager) CreateAllIndexes() error {
 		return err
 	}
 
-	if err := uim.createTiDBOptimizedIndexes(); err != nil {
-		return err
+	if IsTiDBDriver(driver) {
+		if err := uim.createTiDBOptimizedIndexes(); err != nil {
+			return err
+		}
 	}
 
 	log.Println("[OK] All indexes created successfully")
@@ -211,12 +218,38 @@ func (uim *UnifiedIndexManager) executeIndexes(indexes []string, category string
 		indexName := extractIndexName(idx)
 		log.Printf("[INDEX] Creating %s index %d/%d: %s", category, i+1, total, indexName)
 
-		if err := uim.db.Exec(idx).Error; err != nil {
+		if err := uim.createIndexIfMissing(idx, indexName); err != nil {
 			log.Printf("[WARNING] Failed to create %s index %s: %v", category, indexName, err)
 			// Continue with other indexes even if one fails
 		}
 	}
 	return nil
+}
+
+func (uim *UnifiedIndexManager) createIndexIfMissing(sqlText, indexName string) error {
+	tableName := extractIndexTable(sqlText)
+	if tableName == "" {
+		return uim.db.Exec(sqlText).Error
+	}
+
+	var existing int64
+	if err := uim.db.Raw(`
+		SELECT COUNT(*)
+		FROM information_schema.statistics
+		WHERE table_schema = DATABASE()
+		  AND table_name = ?
+		  AND index_name = ?
+	`, tableName, indexName).Scan(&existing).Error; err != nil {
+		log.Printf("[WARNING] Could not check existing index %s on %s: %v", indexName, tableName, err)
+	}
+	if existing > 0 {
+		return nil
+	}
+
+	// MySQL does not support CREATE INDEX IF NOT EXISTS. TiDB does, but the
+	// stripped form is portable after the information_schema check above.
+	sqlText = strings.Replace(sqlText, "CREATE INDEX IF NOT EXISTS", "CREATE INDEX", 1)
+	return uim.db.Exec(sqlText).Error
 }
 
 // extractIndexName extracts the index name from CREATE INDEX SQL statement
@@ -229,6 +262,15 @@ func extractIndexName(sql string) string {
 		}
 	}
 	return "unknown"
+}
+
+func extractIndexTable(sql string) string {
+	re := regexp.MustCompile(`(?i)\sON\s+` + "`?" + `([a-zA-Z0-9_]+)` + "`?" + `\s*\(`)
+	matches := re.FindStringSubmatch(sql)
+	if len(matches) < 2 {
+		return ""
+	}
+	return matches[1]
 }
 
 // AnalyzeTables updates table statistics for query optimizer

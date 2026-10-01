@@ -4,9 +4,18 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
+)
+
+const (
+	DatabaseDriverMySQL = "mysql"
+	DatabaseDriverTiDB  = "tidb"
+
+	IndexingProfileFull      = "full"
+	IndexingProfileHoneycomb = "honeycomb"
 )
 
 // Config represents the complete Nectar configuration
@@ -25,6 +34,7 @@ type Config struct {
 
 // DatabaseConfig holds database connection settings
 type DatabaseConfig struct {
+	Driver          string        `toml:"driver"`
 	DSN             string        `toml:"dsn"`
 	ConnectionPool  int           `toml:"connection_pool"`
 	MaxIdleConns    int           `toml:"max_idle_conns"`
@@ -50,25 +60,25 @@ type RewardsConfig struct {
 // PerformanceConfig holds performance tuning settings
 type PerformanceConfig struct {
 	// System Capabilities (maximums)
-	MaxWorkers      int `toml:"max_workers"`
-	MaxConnections  int `toml:"max_connections"`
-	MaxBatchSize    int `toml:"max_batch_size"`
-	MaxQueueSize    int `toml:"max_queue_size"`
-	
+	MaxWorkers     int `toml:"max_workers"`
+	MaxConnections int `toml:"max_connections"`
+	MaxBatchSize   int `toml:"max_batch_size"`
+	MaxQueueSize   int `toml:"max_queue_size"`
+
 	// Optimization Strategy
 	OptimizationMode string `toml:"optimization_mode"` // "auto", "manual", "aggressive", "conservative"
-	
+
 	// Manual Settings (only used when optimization_mode = "manual")
 	ManualWorkers    int `toml:"manual_workers"`
 	ManualBatchSize  int `toml:"manual_batch_size"`
 	ManualQueueSize  int `toml:"manual_queue_size"`
 	ManualFetchRange int `toml:"manual_fetch_range"`
-	
+
 	// Other settings
-	BulkModeEnabled bool          `toml:"bulk_mode_enabled"`
-	StatsInterval   time.Duration `toml:"stats_interval"`
+	BulkModeEnabled   bool          `toml:"bulk_mode_enabled"`
+	StatsInterval     time.Duration `toml:"stats_interval"`
 	BlockfetchTimeout time.Duration `toml:"blockfetch_timeout"`
-	
+
 	// Legacy support (will be migrated)
 	WorkerCount        int `toml:"worker_count"`
 	BulkFetchRangeSize int `toml:"bulk_fetch_range_size"`
@@ -119,6 +129,11 @@ type AuthConfig struct {
 // By default, all components are enabled for full indexing.
 // Set individual options to false to skip specific data types.
 type IndexingConfig struct {
+	// Profile selects a known indexing footprint.
+	// "full" preserves the broad Nectar table set.
+	// "honeycomb" indexes only the base/product data Honeycomb needs.
+	Profile string `toml:"profile"`
+
 	// Core components (always required)
 	Transactions bool `toml:"transactions"`
 	Blocks       bool `toml:"blocks"`
@@ -155,6 +170,7 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{
 		Version: "1.0",
 		Database: DatabaseConfig{
+			Driver:          DatabaseDriverMySQL,
 			ConnectionPool:  8,
 			MaxIdleConns:    4,
 			MaxOpenConns:    8,
@@ -208,6 +224,8 @@ func Load(path string) (*Config, error) {
 			Secret:   "nectar-secret-key",
 		},
 		Indexing: IndexingConfig{
+			Profile: IndexingProfileFull,
+
 			// Full indexing enabled by default
 			// Users can disable specific components in nectar.toml
 			Transactions: true,
@@ -257,6 +275,9 @@ func Load(path string) (*Config, error) {
 	// Apply environment variable overrides
 	cfg.applyEnvOverrides()
 
+	// Apply profile-derived settings after env overrides so a profile is decisive.
+	cfg.applyProfiles()
+
 	// Validate configuration
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
@@ -268,6 +289,11 @@ func Load(path string) (*Config, error) {
 // applyEnvOverrides applies environment variable overrides to the configuration
 func (c *Config) applyEnvOverrides() {
 	// Database overrides
+	if driver := os.Getenv("NECTAR_DB_DRIVER"); driver != "" {
+		c.Database.Driver = driver
+	} else if driver := os.Getenv("DB_DRIVER"); driver != "" {
+		c.Database.Driver = driver
+	}
 	if dsn := os.Getenv("TIDB_DSN"); dsn != "" {
 		c.Database.DSN = dsn
 	}
@@ -300,7 +326,6 @@ func (c *Config) applyEnvOverrides() {
 		c.Performance.StatsInterval = interval
 	}
 
-
 	// Dashboard overrides
 	if dashType := os.Getenv("DASHBOARD_TYPE"); dashType != "" {
 		c.Dashboard.Type = dashType
@@ -322,10 +347,61 @@ func (c *Config) applyEnvOverrides() {
 	if level := os.Getenv("LOG_LEVEL"); level != "" {
 		c.Monitoring.LogLevel = level
 	}
+
+	// Indexing profile override
+	if profile := os.Getenv("NECTAR_INDEXING_PROFILE"); profile != "" {
+		c.Indexing.Profile = profile
+	}
+}
+
+func (c *Config) applyProfiles() {
+	c.Database.Driver = NormalizeDatabaseDriver(c.Database.Driver)
+	c.Indexing.Profile = strings.ToLower(strings.TrimSpace(c.Indexing.Profile))
+	if c.Indexing.Profile == "" {
+		c.Indexing.Profile = IndexingProfileFull
+	}
+
+	if c.Indexing.Profile != IndexingProfileHoneycomb {
+		return
+	}
+
+	c.Indexing.Transactions = true
+	c.Indexing.Blocks = true
+	c.Indexing.Metadata = true
+	c.Indexing.Assets = true
+	c.Indexing.Minting = true
+	c.Indexing.UTXOs = false
+	c.Indexing.Inputs = true
+	c.Indexing.Outputs = true
+	c.Indexing.Certificates = false
+	c.Indexing.Governance = false
+	c.Indexing.Withdrawals = false
+	c.Indexing.Scripts = false
+	c.Indexing.Collateral = false
+	c.Indexing.WalletConnections = true
+
+	// Honeycomb does not need live state-query reward calculations for product tables.
+	c.StateQuery.Enabled = false
+}
+
+func NormalizeDatabaseDriver(driver string) string {
+	switch strings.ToLower(strings.TrimSpace(driver)) {
+	case "", DatabaseDriverMySQL:
+		return DatabaseDriverMySQL
+	case DatabaseDriverTiDB:
+		return DatabaseDriverTiDB
+	default:
+		return strings.ToLower(strings.TrimSpace(driver))
+	}
 }
 
 // validate checks if the configuration is valid
 func (c *Config) validate() error {
+	switch c.Database.Driver {
+	case DatabaseDriverMySQL, DatabaseDriverTiDB:
+	default:
+		return fmt.Errorf("database driver must be %q or %q", DatabaseDriverMySQL, DatabaseDriverTiDB)
+	}
 	if c.Database.DSN == "" {
 		return fmt.Errorf("database DSN is required")
 	}
@@ -337,6 +413,11 @@ func (c *Config) validate() error {
 	}
 	if c.Performance.WorkerCount <= 0 {
 		return fmt.Errorf("worker count must be positive")
+	}
+	switch c.Indexing.Profile {
+	case IndexingProfileFull, IndexingProfileHoneycomb:
+	default:
+		return fmt.Errorf("indexing profile must be %q or %q", IndexingProfileFull, IndexingProfileHoneycomb)
 	}
 	return nil
 }
@@ -381,19 +462,19 @@ func Marshal(cfg *Config) ([]byte, error) {
 
 // ActivePerformanceConfig represents the currently active settings
 type ActivePerformanceConfig struct {
-	Workers      int
-	Connections  int
-	BatchSize    int
-	QueueSize    int
-	FetchRange   int
-	Source       string // "auto (Byron)", "manual", etc.
+	Workers     int
+	Connections int
+	BatchSize   int
+	QueueSize   int
+	FetchRange  int
+	Source      string // "auto (Byron)", "manual", etc.
 }
 
 // GetActiveConfig returns the active configuration based on mode and epoch
 func (pc *PerformanceConfig) GetActiveConfig(epochNo uint64) *ActivePerformanceConfig {
 	// Handle legacy migration first
 	pc.migrateLegacyConfig()
-	
+
 	switch pc.OptimizationMode {
 	case "manual":
 		return pc.getManualConfig()
@@ -425,7 +506,7 @@ func (pc *PerformanceConfig) migrateLegacyConfig() {
 		pc.ManualBatchSize = pc.BulkFetchRangeSize
 		pc.ManualFetchRange = pc.BulkFetchRangeSize
 	}
-	
+
 	// Set defaults if still not set
 	if pc.MaxWorkers == 0 {
 		pc.MaxWorkers = 16
@@ -449,7 +530,7 @@ func (pc *PerformanceConfig) getEraAwareConfig(epochNo uint64) *ActivePerformanc
 	// Import era config logic
 	var workers, batchSize, queueSize, fetchRange int
 	var eraName string
-	
+
 	// Determine era-specific values
 	switch {
 	case epochNo < 208: // Byron
@@ -483,15 +564,15 @@ func (pc *PerformanceConfig) getEraAwareConfig(epochNo uint64) *ActivePerformanc
 		fetchRange = 500
 		eraName = "Babbage"
 	}
-	
+
 	// Apply system limits
 	workers = min(workers, pc.MaxWorkers)
 	batchSize = min(batchSize, pc.MaxBatchSize)
 	queueSize = min(queueSize, pc.MaxQueueSize)
-	
+
 	return &ActivePerformanceConfig{
 		Workers:     workers,
-		Connections: min(workers * 4, pc.MaxConnections),
+		Connections: min(workers*4, pc.MaxConnections),
 		BatchSize:   batchSize,
 		QueueSize:   queueSize,
 		FetchRange:  fetchRange,
@@ -503,7 +584,7 @@ func (pc *PerformanceConfig) getEraAwareConfig(epochNo uint64) *ActivePerformanc
 func (pc *PerformanceConfig) getManualConfig() *ActivePerformanceConfig {
 	return &ActivePerformanceConfig{
 		Workers:     min(pc.ManualWorkers, pc.MaxWorkers),
-		Connections: min(pc.ManualWorkers * 4, pc.MaxConnections),
+		Connections: min(pc.ManualWorkers*4, pc.MaxConnections),
 		BatchSize:   min(pc.ManualBatchSize, pc.MaxBatchSize),
 		QueueSize:   min(pc.ManualQueueSize, pc.MaxQueueSize),
 		FetchRange:  pc.ManualFetchRange,
@@ -526,10 +607,10 @@ func (pc *PerformanceConfig) getAggressiveConfig() *ActivePerformanceConfig {
 // getConservativeConfig returns safe, stable settings
 func (pc *PerformanceConfig) getConservativeConfig() *ActivePerformanceConfig {
 	return &ActivePerformanceConfig{
-		Workers:     max(4, pc.MaxWorkers / 4),
-		Connections: max(16, pc.MaxConnections / 4),
-		BatchSize:   max(100, pc.MaxBatchSize / 10),
-		QueueSize:   max(1000, pc.MaxQueueSize / 10),
+		Workers:     max(4, pc.MaxWorkers/4),
+		Connections: max(16, pc.MaxConnections/4),
+		BatchSize:   max(100, pc.MaxBatchSize/10),
+		QueueSize:   max(1000, pc.MaxQueueSize/10),
 		FetchRange:  500,
 		Source:      "conservative",
 	}

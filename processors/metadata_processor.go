@@ -16,6 +16,7 @@ import (
 type MetadataProcessor struct {
 	db             *gorm.DB
 	errorCollector *ErrorCollector
+	quiet          bool
 }
 
 // NewMetadataProcessor creates a new metadata processor
@@ -24,6 +25,10 @@ func NewMetadataProcessor(db *gorm.DB) *MetadataProcessor {
 		db:             db,
 		errorCollector: GetGlobalErrorCollector(),
 	}
+}
+
+func (mp *MetadataProcessor) SetQuiet(quiet bool) {
+	mp.quiet = quiet
 }
 
 // ProcessTransactionMetadata processes metadata from a transaction
@@ -102,7 +107,9 @@ func (mp *MetadataProcessor) ProcessTransactionMetadata(ctx context.Context, tx 
 			return nil
 		}
 
-		log.Printf("Processing %d metadata entries for transaction %x (era %d)", len(metadata), txHash, blockType)
+		if !mp.quiet {
+			log.Printf("Processing %d metadata entries for transaction %x (era %d)", len(metadata), txHash, blockType)
+		}
 
 		for key, value := range metadata {
 			if err := mp.processMetadataEntry(tx, txHash, key, value); err != nil {
@@ -169,7 +176,9 @@ func (mp *MetadataProcessor) processMetadataEntry(tx *gorm.DB, txHash []byte, ke
 		return fmt.Errorf("failed to create metadata record: %w", err)
 	}
 
-	log.Printf("[OK] Processed metadata entry: tx_hash=%x, key=%d", txHash, key)
+	if !mp.quiet {
+		log.Printf("[OK] Processed metadata entry: tx_hash=%x, key=%d", txHash, key)
+	}
 	return nil
 }
 
@@ -203,7 +212,9 @@ func (mp *MetadataProcessor) processScript(tx *gorm.DB, txHash []byte, script in
 	// Create script record
 	// Note: This would typically be handled by the script processor
 	// but shown here for completeness
-	log.Printf("Found script in metadata: type=%s, hash=%s", scriptType, hex.EncodeToString(scriptHash))
+	if !mp.quiet {
+		log.Printf("Found script in metadata: type=%s, hash=%s", scriptType, hex.EncodeToString(scriptHash))
+	}
 
 	return nil
 }
@@ -272,7 +283,9 @@ func (mp *MetadataProcessor) BatchProcessMetadata(ctx context.Context, tx *gorm.
 		return nil
 	}
 
-	log.Printf("Batch processing %d metadata entries", len(metadataBatch))
+	if !mp.quiet {
+		log.Printf("Batch processing %d metadata entries", len(metadataBatch))
+	}
 
 	for _, item := range metadataBatch {
 		if err := mp.processMetadataEntry(tx, item.TxHash, item.Key, item.Value); err != nil {
@@ -409,7 +422,9 @@ func (mp *MetadataProcessor) ProcessMetadata(tx *gorm.DB, txHash []byte, metadat
 		return nil
 	}
 
-	log.Printf("Processing %d metadata entries for transaction %x", len(metadataMap), txHash)
+	if !mp.quiet {
+		log.Printf("Processing %d metadata entries for transaction %x", len(metadataMap), txHash)
+	}
 
 	for key, value := range metadataMap {
 		if err := mp.processMetadataEntry(tx, txHash, key, value); err != nil {

@@ -151,26 +151,33 @@ func (eb *EventBus) acceptSubscribers() {
 		eb.mu.Unlock()
 
 		log.Printf("[EVENT_BUS] New subscriber connected: %s (total: %d)", id, eb.SubscriberCount())
-
-		// Monitor connection for disconnect
-		go eb.monitorConnection(id, conn)
 	}
 }
 
-// monitorConnection watches for subscriber disconnect
-func (eb *EventBus) monitorConnection(id string, conn net.Conn) {
-	buf := make([]byte, 1)
-	for {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		_, err := conn.Read(buf)
-		if err != nil {
-			eb.mu.Lock()
-			delete(eb.subscribers, id)
-			eb.mu.Unlock()
-			conn.Close()
-			log.Printf("[EVENT_BUS] Subscriber disconnected: %s", id)
-			return
-		}
+type subscriberConn struct {
+	id   string
+	conn net.Conn
+}
+
+func (eb *EventBus) snapshotSubscribers() []subscriberConn {
+	eb.mu.RLock()
+	defer eb.mu.RUnlock()
+
+	subscribers := make([]subscriberConn, 0, len(eb.subscribers))
+	for id, conn := range eb.subscribers {
+		subscribers = append(subscribers, subscriberConn{id: id, conn: conn})
+	}
+	return subscribers
+}
+
+func (eb *EventBus) removeSubscriber(id string, conn net.Conn) {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+
+	if current, ok := eb.subscribers[id]; ok && current == conn {
+		delete(eb.subscribers, id)
+		conn.Close()
+		log.Printf("[EVENT_BUS] Subscriber disconnected: %s", id)
 	}
 }
 
@@ -206,18 +213,20 @@ func (eb *EventBus) sendEventToSubscribers(event models.TokenHolderEvent) {
 	// Add newline delimiter for easy parsing
 	data = append(data, '\n')
 
-	// Send to all subscribers
-	eb.mu.RLock()
-	for id, conn := range eb.subscribers {
-		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		_, err := conn.Write(data)
-		if err != nil {
+	for _, subscriber := range eb.snapshotSubscribers() {
+		if err := subscriber.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
 			eb.broadcastErrors.Add(1)
-			log.Printf("[EVENT_BUS] Failed to send to %s: %v", id, err)
-			// Don't remove here, let monitorConnection handle it
+			log.Printf("[EVENT_BUS] Failed to set write deadline for %s: %v", subscriber.id, err)
+			eb.removeSubscriber(subscriber.id, subscriber.conn)
+			continue
+		}
+
+		if _, err := subscriber.conn.Write(data); err != nil {
+			eb.broadcastErrors.Add(1)
+			log.Printf("[EVENT_BUS] Failed to send to %s: %v", subscriber.id, err)
+			eb.removeSubscriber(subscriber.id, subscriber.conn)
 		}
 	}
-	eb.mu.RUnlock()
 }
 
 // PublishEvent sends an event to all subscribers.
@@ -273,21 +282,21 @@ func (eb *EventBus) Stats() EventBusStats {
 
 // BlockEvent represents a block-level event (for broader notifications)
 type BlockEvent struct {
-	Type       string   `json:"type"` // "block_processed"
-	Slot       uint64   `json:"slot"`
-	BlockHash  string   `json:"block_hash"`
-	TxCount    int      `json:"tx_count"`
+	Type          string        `json:"type"` // "block_processed"
+	Slot          uint64        `json:"slot"`
+	BlockHash     string        `json:"block_hash"`
+	TxCount       int           `json:"tx_count"`
 	TokensChanged []TokenChange `json:"tokens_changed"`
 }
 
 // TokenChange summarizes changes to a specific token in a block
 type TokenChange struct {
-	PolicyID    string `json:"policy_id"`
-	AssetName   string `json:"asset_name"`
-	Fingerprint string `json:"fingerprint"`
-	HoldersAdded   int `json:"holders_added"`
-	HoldersRemoved int `json:"holders_removed"`
-	TxCount        int `json:"tx_count"`
+	PolicyID       string `json:"policy_id"`
+	AssetName      string `json:"asset_name"`
+	Fingerprint    string `json:"fingerprint"`
+	HoldersAdded   int    `json:"holders_added"`
+	HoldersRemoved int    `json:"holders_removed"`
+	TxCount        int    `json:"tx_count"`
 }
 
 // PublishBlockEvent publishes a summary event for a processed block
@@ -299,13 +308,18 @@ func (eb *EventBus) PublishBlockEvent(event BlockEvent) {
 	}
 	data = append(data, '\n')
 
-	eb.mu.RLock()
-	for id, conn := range eb.subscribers {
-		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		_, err := conn.Write(data)
-		if err != nil {
-			log.Printf("[EVENT_BUS] Failed to send block event to %s: %v", id, err)
+	for _, subscriber := range eb.snapshotSubscribers() {
+		if err := subscriber.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			eb.broadcastErrors.Add(1)
+			log.Printf("[EVENT_BUS] Failed to set write deadline for %s: %v", subscriber.id, err)
+			eb.removeSubscriber(subscriber.id, subscriber.conn)
+			continue
+		}
+
+		if _, err := subscriber.conn.Write(data); err != nil {
+			eb.broadcastErrors.Add(1)
+			log.Printf("[EVENT_BUS] Failed to send block event to %s: %v", subscriber.id, err)
+			eb.removeSubscriber(subscriber.id, subscriber.conn)
 		}
 	}
-	eb.mu.RUnlock()
 }

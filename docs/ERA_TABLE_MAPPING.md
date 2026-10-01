@@ -2,6 +2,17 @@
 
 ## Overview
 This document maps which database tables should contain data in each Cardano era.
+It now distinguishes three different states that older versions of this file
+blurred together:
+
+- A table/model exists in the codebase.
+- A processor package can write the table.
+- The active `BlockProcessor` transaction path actually calls that processor.
+
+As of May 26, 2026, the active path calls assets, metadata, scripts,
+collateral/reference-input handling, wallet connections, token holders, and
+token transfers. Certificate, withdrawal, and governance processors exist, but
+they are not currently fields/calls in the main transaction path.
 
 ## Era Timeline
 - **Byron**: Epochs 0-207 (Slots 0-4,492,799)
@@ -14,7 +25,7 @@ This document maps which database tables should contain data in each Cardano era
 
 ## Tables by Era
 
-### ✅ Currently Populated by Nectar
+### Active or Intended Tables by Era
 
 #### All Eras (Byron+)
 - `blocks` - Block data
@@ -24,18 +35,13 @@ This document maps which database tables should contain data in each Cardano era
 - `slot_leaders` - Block producers
 
 #### Shelley+ (Epochs 208+)
-- `stake_addresses` - Stake addresses
-- `stake_registrations` - Stake key registrations
-- `stake_deregistrations` - Stake key deregistrations
-- `delegations` - Stake delegations
-- `withdrawals` - Reward withdrawals
-- `pool_hashes` - Stake pool identifiers
-- `pool_updates` - Pool registration/updates
-- `pool_retires` - Pool retirements
-- `pool_metadata_refs` - Pool metadata URLs
-- `pool_owners` - Pool owner stake addresses
-- `pool_relays` - Pool relay information
-- `epoches` - Epoch boundaries
+- `epoches` - Epoch boundaries are handled by `BlockProcessor`.
+- `stake_addresses`, `stake_registrations`, `stake_deregistrations`,
+  `delegations`, `withdrawals`, `pool_hashes`, `pool_updates`, `pool_retires`,
+  `pool_metadata_refs`, `pool_owners`, and `pool_relays` have models and
+  processor-package support, but the active `BlockProcessor` transaction path
+  does not currently wire certificate or withdrawal processors. Do not assume
+  these tables are populated in a fresh active run without runtime verification.
 
 #### Allegra+ (Epochs 236+)
 - Transaction validity intervals (`invalid_before`, `invalid_hereafter` in `txes`)
@@ -52,27 +58,42 @@ This document maps which database tables should contain data in each Cardano era
 - `collateral_tx_ins` - Collateral inputs
 - `collateral_tx_outs` - Collateral outputs (Babbage+)
 - `reference_tx_ins` - Reference inputs (Babbage+)
+- `required_signers` - Required signer hashes when script indexing is enabled
+
+Reference script caveat: model fields exist for reference script hashes, but
+the current `getOutputReferenceScript` path still returns nil because the
+needed script-ref accessor is not exposed through the active ledger interface.
 
 #### Conway+ (Epochs 491+)
-- Governance tables (DReps, votes, proposals, etc.)
+- Governance models and package processors exist for DReps, votes, proposals,
+  committees, constitutions, treasury withdrawals, and related data. They are
+  not currently wired into the active `BlockProcessor` transaction path, so this
+  is implemented package code rather than proven live population.
 
-### ❌ Not Yet Populated (Requires State Query)
+### Partial or Not Yet Proven State Query Tables
 
-These tables require local state query integration:
+These tables require local state query integration or currently have partial
+runtime behavior:
 
 #### Epoch-level data
-- `ada_pots` - ADA distribution (treasury, reserves, rewards, etc.)
-- `epoch_params` - Protocol parameters per epoch
+- `ada_pots` - ADA distribution calculator exists, but is not wired as an
+  active `BlockProcessor` field.
+- `epoch_params` - `EpochParamsProvider` is called at epoch boundaries.
 - `epoch_stake_progresses` - Stake distribution snapshots
 
 #### Reward data
-- `rewards` - Individual staking rewards
+- `rewards` - Local reward calculation is conditionally invoked through
+  `StateQueryService`; direct live-state reward querying still contains
+  placeholder/incomplete paths.
 - `instant_rewards` - MIR certificates
 
 #### Pool performance
 - `pool_stats` - Pool performance metrics
 
-## Current Status in Allegra (Epoch 242)
+## Historical Snapshot: Allegra (Epoch 242)
+
+The counts below are a prior database snapshot, not a current verification of a
+fresh run.
 
 ### ✅ Working Correctly
 - 192,951 blocks
@@ -82,12 +103,12 @@ These tables require local state query integration:
 - 68,507 withdrawals
 - **Validity intervals**: 99.9% of Allegra transactions use this feature
 
-### ❌ Missing (Expected)
+### Historical Missing/Expected
 - **Metadata**: Not common until later epochs
 - **Scripts**: Not available until Alonzo
 - **Multi-assets**: Not available until Mary
-- **Ada pots**: Requires state query implementation
-- **Epoch params**: Requires state query implementation
+- **Ada pots**: still not proven as actively wired
+- **Epoch params**: now have an epoch-boundary provider path; verify against a live DB before claiming full db-sync parity
 
 ## Verification Commands
 
@@ -113,6 +134,9 @@ WHERE b.epoch_no BETWEEN 236 AND 250;
 ```
 
 ## Notes
-- Nectar is correctly capturing all blockchain data available from the node
-- State query features (ada_pots, epoch_params, rewards) require additional implementation
-- The indexer is working as designed for the current implementation scope
+- Do not treat table/model existence as proof that live indexing populates the
+  table.
+- State-query features are mixed: `epoch_params` has an active provider path,
+  rewards are conditional/partial, and `ada_pots` is not actively wired.
+- The current implementation scope still needs runtime verification before any
+  broad "working as designed" claim.

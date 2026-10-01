@@ -48,12 +48,15 @@ type BlockProcessor struct {
 	metadataProcessor         *MetadataProcessor
 	scriptProcessor           *ScriptProcessor
 	walletConnectionProcessor *WalletConnectionProcessor
-	tokenHolderProcessor      *TokenHolderProcessor // Tracks token holder balances in real-time
+	tokenHolderProcessor      *TokenHolderProcessor   // Tracks token holder balances in real-time
+	tokenTransferProcessor    *TokenTransferProcessor // Tracks token transfers between wallets
 	epochParamsProvider       *EpochParamsProvider
 	stateQueryService         StateQueryService
 	txSemaphore               chan struct{} // Limits concurrent transaction processing
 	currentEraConfig          *EraConfig    // Current era configuration
 	currentEpoch              uint64        // Track current epoch for era detection
+	bulkHistoryTransactions   bool          // Batch base-table tx work during safe history replay
+	skipPerBlockHealthCheck   bool          // Avoid per-block ping during resumable history imports
 }
 
 // NewBlockProcessor creates a new block processor
@@ -69,10 +72,32 @@ func NewBlockProcessor(db *gorm.DB, cfg *config.IndexingConfig) *BlockProcessor 
 		scriptProcessor:           NewScriptProcessor(db),
 		walletConnectionProcessor: NewWalletConnectionProcessor(db),
 		tokenHolderProcessor:      NewTokenHolderProcessor(db, nil), // nil eventChan for now, can be wired up later
+		tokenTransferProcessor:    NewTokenTransferProcessor(db, nil),
 		epochParamsProvider:       NewEpochParamsProvider(db),
 		txSemaphore:               make(chan struct{}, 16), // Reduced to 16 for memory efficiency
 		currentEraConfig:          GetEraConfig(0),         // Start with Byron config
 		currentEpoch:              0,
+	}
+	return bp
+}
+
+// NewBlockProcessorForHistoryImport creates a block processor for bulk historical
+// replay. Product-derived tables can be rebuilt after base history is complete,
+// so disabling them during import reduces duplicate work and write load.
+func NewBlockProcessorForHistoryImport(db *gorm.DB, cfg *config.IndexingConfig, derivedProducts bool) *BlockProcessor {
+	bp := NewBlockProcessor(db, cfg)
+	bp.skipPerBlockHealthCheck = true
+	bp.assetProcessor.SetQuiet(true)
+	bp.metadataProcessor.SetQuiet(true)
+	if !derivedProducts {
+		bp.walletConnectionProcessor = nil
+		bp.tokenHolderProcessor = nil
+		bp.tokenTransferProcessor = nil
+		bp.bulkHistoryTransactions = !cfg.Certificates &&
+			!cfg.Governance &&
+			!cfg.Withdrawals &&
+			!cfg.Scripts &&
+			!cfg.Collateral
 	}
 	return bp
 }
@@ -90,6 +115,7 @@ func NewBlockProcessorWithEvents(db *gorm.DB, cfg *config.IndexingConfig, eventC
 		scriptProcessor:           NewScriptProcessor(db),
 		walletConnectionProcessor: NewWalletConnectionProcessor(db),
 		tokenHolderProcessor:      NewTokenHolderProcessor(db, eventChan),
+		tokenTransferProcessor:    NewTokenTransferProcessor(db, nil), // Separate event channel if needed later
 		epochParamsProvider:       NewEpochParamsProvider(db),
 		txSemaphore:               make(chan struct{}, 16),
 		currentEraConfig:          GetEraConfig(0),
@@ -140,8 +166,10 @@ func (bp *BlockProcessor) ProcessBlock(ctx context.Context, block ledger.Block, 
 	}
 
 	// Ensure we start with a healthy connection (use context for timeout)
-	if err := bp.EnsureHealthyConnectionWithContext(ctx); err != nil {
-		return fmt.Errorf("connection unhealthy before processing: %w", err)
+	if !bp.skipPerBlockHealthCheck {
+		if err := bp.EnsureHealthyConnectionWithContext(ctx); err != nil {
+			return fmt.Errorf("connection unhealthy before processing: %w", err)
+		}
 	}
 
 	// Check context before starting work
@@ -193,8 +221,233 @@ func (bp *BlockProcessor) ProcessBlock(ctx context.Context, block ledger.Block, 
 	return nil
 }
 
+// ProcessHistoryBlocks stores a contiguous historical block chunk using the
+// fastest safe path available for the configured import mode.
+func (bp *BlockProcessor) ProcessHistoryBlocks(ctx context.Context, blocks []ledger.Block, blockTypes []uint) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+	if len(blocks) != len(blockTypes) {
+		return fmt.Errorf("history block batch length mismatch: blocks=%d blockTypes=%d", len(blocks), len(blockTypes))
+	}
+	if !bp.bulkHistoryTransactions {
+		for idx, block := range blocks {
+			if len(block.Transactions()) == 0 {
+				if err := bp.ProcessEmptyBlocks(ctx, []ledger.Block{block}, []uint{blockTypes[idx]}); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := bp.ProcessBlock(ctx, block, blockTypes[idx]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := bp.processHistoryBlockBatch(ctx, blocks, blockTypes); err != nil {
+		if len(blocks) == 1 || ctx.Err() != nil {
+			return err
+		}
+		mid := len(blocks) / 2
+		firstBlock := blocks[0].BlockNumber()
+		lastBlock := blocks[len(blocks)-1].BlockNumber()
+		log.Printf("[HISTORY] Falling back to smaller SQL batches for blocks %d-%d after batch error: %v", firstBlock, lastBlock, err)
+		if err := bp.ProcessHistoryBlocks(ctx, blocks[:mid], blockTypes[:mid]); err != nil {
+			return err
+		}
+		if err := bp.ProcessHistoryBlocks(ctx, blocks[mid:], blockTypes[mid:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (bp *BlockProcessor) processHistoryBlockBatch(ctx context.Context, blocks []ledger.Block, blockTypes []uint) error {
+	if !bp.skipPerBlockHealthCheck {
+		if err := bp.EnsureHealthyConnectionWithContext(ctx); err != nil {
+			return fmt.Errorf("connection unhealthy before processing history block batch: %w", err)
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	dbBlocks := make([]models.Block, 0, len(blocks))
+	txBlocks := make([]struct {
+		block     ledger.Block
+		dbBlock   models.Block
+		blockType uint
+	}, 0)
+	epochBoundaries := make([]struct {
+		block   models.Block
+		epochNo uint32
+		typ     uint
+	}, 0)
+
+	for idx, block := range blocks {
+		blockType := blockTypes[idx]
+		slotNumber := block.Header().SlotNumber()
+		epochNo := bp.getEpochForSlot(slotNumber, blockType)
+		if uint64(epochNo) != bp.currentEpoch {
+			bp.updateEraConfig(epochNo)
+		}
+		if block.BlockNumber()%100 == 0 {
+			log.Printf("[BLOCK] Processing block %d (slot %d, era %s)", block.BlockNumber(), slotNumber, bp.getEraName(blockType))
+		}
+
+		dbBlock := bp.buildDBBlock(block, blockType)
+		dbBlocks = append(dbBlocks, *dbBlock)
+		if len(block.Transactions()) > 0 {
+			txBlocks = append(txBlocks, struct {
+				block     ledger.Block
+				dbBlock   models.Block
+				blockType uint
+			}{block: block, dbBlock: *dbBlock, blockType: blockType})
+		}
+		if bp.isEpochBoundary(slotNumber, blockType) {
+			epochBoundaries = append(epochBoundaries, struct {
+				block   models.Block
+				epochNo uint32
+				typ     uint
+			}{block: *dbBlock, epochNo: epochNo, typ: blockType})
+		}
+	}
+
+	return database.RetryTransaction(bp.db, func(tx *gorm.DB) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := database.FastCreateInBatches(tx, dbBlocks, len(dbBlocks)); err != nil {
+			return fmt.Errorf("failed to batch insert history block headers: %w", err)
+		}
+		for _, boundary := range epochBoundaries {
+			dbBlock := boundary.block
+			if err := bp.processEpochBoundary(ctx, tx, &dbBlock, boundary.epochNo, boundary.typ); err != nil {
+				unifiederrors.Get().Warning("BlockProcessor", "ProcessEpochBoundary", fmt.Sprintf("Failed to process epoch boundary at slot %d: %v", *dbBlock.SlotNo, err))
+			}
+		}
+		for _, item := range txBlocks {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			slotNumber := item.block.Header().SlotNumber()
+			epochNo := bp.getEpochForSlot(slotNumber, item.blockType)
+			if uint64(epochNo) != bp.currentEpoch {
+				bp.updateEraConfig(epochNo)
+			}
+			if err := bp.processTransactionBatch(ctx, tx, item.dbBlock.Hash, item.block.Transactions(), 0, item.blockType); err != nil {
+				return fmt.Errorf("failed to process transactions for block %d slot %d: %w", item.block.BlockNumber(), slotNumber, err)
+			}
+		}
+		return nil
+	})
+}
+
+// ProcessHistoryBlock stores a non-empty historical block using the fastest safe
+// path available for the configured import mode.
+func (bp *BlockProcessor) ProcessHistoryBlock(ctx context.Context, block ledger.Block, blockType uint) error {
+	return bp.ProcessHistoryBlocks(ctx, []ledger.Block{block}, []uint{blockType})
+}
+
+// ProcessEmptyBlocks stores block headers for blocks that have no transactions.
+// Historical imports see many empty Byron blocks; batching those headers avoids
+// paying one SQL transaction per empty block while preserving the normal
+// transaction path for blocks that contain data.
+func (bp *BlockProcessor) ProcessEmptyBlocks(ctx context.Context, blocks []ledger.Block, blockTypes []uint) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+	if len(blocks) != len(blockTypes) {
+		return fmt.Errorf("empty block batch length mismatch: blocks=%d blockTypes=%d", len(blocks), len(blockTypes))
+	}
+	if !bp.skipPerBlockHealthCheck {
+		if err := bp.EnsureHealthyConnectionWithContext(ctx); err != nil {
+			return fmt.Errorf("connection unhealthy before processing empty block batch: %w", err)
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	dbBlocks := make([]models.Block, 0, len(blocks))
+	epochBoundaries := make([]struct {
+		block   models.Block
+		epochNo uint32
+		typ     uint
+	}, 0)
+
+	for idx, block := range blocks {
+		if len(block.Transactions()) != 0 {
+			return fmt.Errorf("block %d has %d transactions; empty batch only accepts empty blocks", block.BlockNumber(), len(block.Transactions()))
+		}
+		blockType := blockTypes[idx]
+		slotNumber := block.Header().SlotNumber()
+		epochNo := bp.getEpochForSlot(slotNumber, blockType)
+		if uint64(epochNo) != bp.currentEpoch {
+			bp.updateEraConfig(epochNo)
+		}
+		if block.BlockNumber()%100 == 0 {
+			log.Printf("[BLOCK] Processing block %d (slot %d, era %s)", block.BlockNumber(), slotNumber, bp.getEraName(blockType))
+		}
+
+		dbBlock := bp.buildDBBlock(block, blockType)
+		dbBlocks = append(dbBlocks, *dbBlock)
+		if bp.isEpochBoundary(slotNumber, blockType) {
+			epochBoundaries = append(epochBoundaries, struct {
+				block   models.Block
+				epochNo uint32
+				typ     uint
+			}{block: *dbBlock, epochNo: epochNo, typ: blockType})
+		}
+	}
+
+	return database.RetryTransaction(bp.db, func(tx *gorm.DB) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := database.FastCreateInBatches(tx, dbBlocks, len(dbBlocks)); err != nil {
+			return fmt.Errorf("failed to batch insert empty block headers: %w", err)
+		}
+		for _, boundary := range epochBoundaries {
+			dbBlock := boundary.block
+			if err := bp.processEpochBoundary(ctx, tx, &dbBlock, boundary.epochNo, boundary.typ); err != nil {
+				unifiederrors.Get().Warning("BlockProcessor", "ProcessEpochBoundary", fmt.Sprintf("Failed to process epoch boundary at slot %d: %v", *dbBlock.SlotNo, err))
+			}
+		}
+		return nil
+	})
+}
+
 // processBlockHeader processes and stores the block header with hash-based primary key
 func (bp *BlockProcessor) processBlockHeader(ctx context.Context, tx *gorm.DB, block ledger.Block, blockType uint) (*models.Block, error) {
+	dbBlock := bp.buildDBBlock(block, blockType)
+	slotNumber := block.Header().SlotNumber()
+	epochNo := bp.getEpochForSlot(slotNumber, blockType)
+
+	// Insert block with fast duplicate handling
+	if err := database.FastCreate(tx, dbBlock); err != nil {
+		hash := block.Header().Hash()
+		hashBytes := hash[:]
+		// If it failed for a reason other than duplicate, check if block exists
+		var existingBlock models.Block
+		if err2 := tx.Where("hash = ?", hashBytes).First(&existingBlock).Error; err2 == nil {
+			// Block already exists, use it
+			return &existingBlock, nil
+		}
+		return nil, fmt.Errorf("failed to create block: %w", err)
+	}
+
+	// Check for epoch boundary
+	if bp.isEpochBoundary(slotNumber, blockType) {
+		if err := bp.processEpochBoundary(ctx, tx, dbBlock, epochNo, blockType); err != nil {
+			unifiederrors.Get().Warning("BlockProcessor", "ProcessEpochBoundary", fmt.Sprintf("Failed to process epoch boundary at slot %d: %v", slotNumber, err))
+		}
+	}
+
+	return dbBlock, nil
+}
+
+func (bp *BlockProcessor) buildDBBlock(block ledger.Block, blockType uint) *models.Block {
 	// Extract block data
 	blockHeader := block.Header()
 	hash := blockHeader.Hash()
@@ -247,25 +500,7 @@ func (bp *BlockProcessor) processBlockHeader(ctx context.Context, tx *gorm.DB, b
 	// Set era-specific fields
 	bp.setEraSpecificBlockFields(dbBlock, block, blockType)
 
-	// Insert block with fast duplicate handling
-	if err := database.FastCreate(tx, dbBlock); err != nil {
-		// If it failed for a reason other than duplicate, check if block exists
-		var existingBlock models.Block
-		if err2 := tx.Where("hash = ?", hashBytes).First(&existingBlock).Error; err2 == nil {
-			// Block already exists, use it
-			return &existingBlock, nil
-		}
-		return nil, fmt.Errorf("failed to create block: %w", err)
-	}
-
-	// Check for epoch boundary
-	if bp.isEpochBoundary(slotNumber, blockType) {
-		if err := bp.processEpochBoundary(ctx, tx, dbBlock, epochNo, blockType); err != nil {
-			unifiederrors.Get().Warning("BlockProcessor", "ProcessEpochBoundary", fmt.Sprintf("Failed to process epoch boundary at slot %d: %v", slotNumber, err))
-		}
-	}
-
-	return dbBlock, nil
+	return dbBlock
 }
 
 // processEraAwareTransactions processes transactions with era-specific handling
@@ -279,6 +514,12 @@ func (bp *BlockProcessor) processEraAwareTransactions(ctx context.Context, db *g
 	blockHash := dbBlock.Hash
 	blockNumber := block.BlockNumber()
 	blockTime := dbBlock.Time
+
+	if bp.bulkHistoryTransactions {
+		return database.RetryTransaction(db, func(dbTx *gorm.DB) error {
+			return bp.processTransactionBatch(ctx, dbTx, blockHash, transactions, 0, blockType)
+		})
+	}
 
 	// Process transactions sequentially to avoid database connection issues
 	// Each transaction still gets its own DB transaction for atomicity
@@ -352,9 +593,18 @@ func (bp *BlockProcessor) processTransaction(ctx context.Context, tx *gorm.DB, b
 	// Era-specific transaction processing
 	bp.setEraSpecificTxFields(&dbTx, transaction, blockType)
 
-	// Insert transaction with fast duplicate handling
-	if err := database.FastCreate(tx, &dbTx); err != nil {
-		return fmt.Errorf("failed to insert transaction: %w", err)
+	// Insert transaction with fast duplicate handling. If INSERT IGNORE skipped
+	// an existing transaction, do not re-run component or product processors;
+	// live ChainSync resumes with a safety margin and will replay a few blocks.
+	result := tx.Clauses(clause.Insert{Modifier: "IGNORE"}).Create(&dbTx)
+	if result.Error != nil {
+		if !strings.Contains(result.Error.Error(), "Duplicate entry") {
+			return fmt.Errorf("failed to insert transaction: %w", result.Error)
+		}
+		return nil
+	}
+	if result.RowsAffected == 0 {
+		return nil
 	}
 
 	// Process transaction components sequentially to avoid "commands out of sync" errors
@@ -446,7 +696,7 @@ func (bp *BlockProcessor) processTransaction(ctx context.Context, tx *gorm.DB, b
 
 	// Process wallet connections - track sender→receiver relationships
 	// This runs after inputs and outputs are processed so we can look up spent UTxO addresses
-	if bp.walletConnectionProcessor != nil {
+	if bp.config.WalletConnections && bp.walletConnectionProcessor != nil {
 		if err := bp.walletConnectionProcessor.ProcessTransaction(tx, txHash, slotNo, transaction); err != nil {
 			unifiederrors.Get().Warning("BlockProcessor", "ProcessWalletConnections", fmt.Sprintf("Failed to process wallet connections: %v", err))
 		}
@@ -454,9 +704,16 @@ func (bp *BlockProcessor) processTransaction(ctx context.Context, tx *gorm.DB, b
 
 	// Process token holders - track incremental balance changes for instant holder queries
 	// This runs after outputs and assets are processed so we can look up token transfers
-	if bp.tokenHolderProcessor != nil {
+	if bp.config.Assets && bp.config.Inputs && bp.config.Outputs && bp.tokenHolderProcessor != nil {
 		if err := bp.tokenHolderProcessor.ProcessTransaction(tx, txHash, slotNo, transaction); err != nil {
 			unifiederrors.Get().Warning("BlockProcessor", "ProcessTokenHolders", fmt.Sprintf("Failed to process token holders: %v", err))
+		}
+	}
+
+	// Track token transfers between wallets (for graph visualization)
+	if bp.config.WalletConnections && bp.config.Assets && bp.config.Inputs && bp.config.Outputs && bp.tokenTransferProcessor != nil {
+		if err := bp.tokenTransferProcessor.ProcessTransaction(tx, txHash, slotNo, transaction); err != nil {
+			unifiederrors.Get().Warning("BlockProcessor", "ProcessTokenTransfers", fmt.Sprintf("Failed to process token transfers: %v", err))
 		}
 	}
 
@@ -574,35 +831,45 @@ func (bp *BlockProcessor) processTransactionBatch(ctx context.Context, tx *gorm.
 		txHash := hash[:]
 
 		// Process transaction inputs
-		if err := bp.processTransactionInputs(ctx, tx, txHash, transaction, blockType); err != nil {
-			unifiederrors.Get().Warning("BlockProcessor", "ProcessInputs", fmt.Sprintf("Failed to process inputs for tx %d: %v", i, err))
+		if bp.config.Inputs || bp.config.UTXOs {
+			if err := bp.processTransactionInputs(ctx, tx, txHash, transaction, blockType); err != nil {
+				unifiederrors.Get().Warning("BlockProcessor", "ProcessInputs", fmt.Sprintf("Failed to process inputs for tx %d: %v", i, err))
+			}
 		}
 
 		// Process transaction outputs
-		if err := bp.processTransactionOutputs(ctx, tx, txHash, transaction, blockType); err != nil {
-			unifiederrors.Get().Warning("BlockProcessor", "ProcessOutputs", fmt.Sprintf("Failed to process outputs for tx %d: %v", i, err))
+		if bp.config.Outputs || bp.config.UTXOs {
+			if err := bp.processTransactionOutputs(ctx, tx, txHash, transaction, blockType); err != nil {
+				unifiederrors.Get().Warning("BlockProcessor", "ProcessOutputs", fmt.Sprintf("Failed to process outputs for tx %d: %v", i, err))
+			}
 		}
 
 		// Process metadata
-		if metadata := transaction.Metadata(); metadata != nil {
-			// Check if metadata has any content
-			if metaValue := metadata.Value(); metaValue != nil {
-				if err := bp.metadataProcessor.ProcessMetadata(tx, txHash, metadata); err != nil {
-					unifiederrors.Get().Warning("BlockProcessor", "ProcessMetadata", fmt.Sprintf("Failed to process metadata: %v", err))
+		if bp.config.Metadata {
+			if metadata := transaction.Metadata(); metadata != nil {
+				// Check if metadata has any content
+				if metaValue := metadata.Value(); metaValue != nil {
+					if err := bp.processFilteredMetadata(ctx, tx, txHash, metadata); err != nil {
+						unifiederrors.Get().Warning("BlockProcessor", "ProcessMetadata", fmt.Sprintf("Failed to process metadata: %v", err))
+					}
 				}
 			}
 		}
 
 		// Process minting/burning
-		if mint := bp.getTransactionMint(transaction, blockType); len(mint) > 0 {
-			if err := bp.assetProcessor.ProcessMint(tx, txHash, mint); err != nil {
-				unifiederrors.Get().Warning("BlockProcessor", "ProcessMint", fmt.Sprintf("Failed to process mint: %v", err))
+		if bp.config.Minting || bp.config.Assets {
+			if mint := bp.getTransactionMint(transaction, blockType); len(mint) > 0 {
+				if err := bp.assetProcessor.ProcessMint(tx, txHash, mint); err != nil {
+					unifiederrors.Get().Warning("BlockProcessor", "ProcessMint", fmt.Sprintf("Failed to process mint: %v", err))
+				}
 			}
 		}
 
 		// Process scripts
-		if err := bp.scriptProcessor.ProcessTransaction(tx, txHash, transaction, blockType); err != nil {
-			unifiederrors.Get().Warning("BlockProcessor", "ProcessScripts", fmt.Sprintf("Failed to process scripts: %v", err))
+		if bp.config.Scripts {
+			if err := bp.scriptProcessor.ProcessTransaction(tx, txHash, transaction, blockType); err != nil {
+				unifiederrors.Get().Warning("BlockProcessor", "ProcessScripts", fmt.Sprintf("Failed to process scripts: %v", err))
+			}
 		}
 	}
 
@@ -1571,6 +1838,65 @@ func (bp *BlockProcessor) processRequiredSigners(ctx context.Context, tx *gorm.D
 			DoNothing: true,
 		}).CreateInBatches(signerBatch, 100).Error; err != nil {
 			return fmt.Errorf("failed to batch insert required signers: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// RollbackData holds data captured before cascade delete for post-rollback cleanup
+type RollbackData struct {
+	AffectedHolders []AffectedHolder
+	AffectedPairs   []AffectedWalletPair
+}
+
+// CaptureRollbackData captures affected data BEFORE cascade-deleting blocks.
+// This must be called while the rolled-back blocks still exist in the database.
+func (bp *BlockProcessor) CaptureRollbackData(tx *gorm.DB, rollbackSlot uint64) (*RollbackData, error) {
+	data := &RollbackData{}
+
+	if bp.tokenHolderProcessor != nil {
+		holders, err := bp.tokenHolderProcessor.CaptureAffectedHolders(tx, rollbackSlot)
+		if err != nil {
+			log.Printf("[ROLLBACK] Warning: Failed to capture affected holders: %v", err)
+		} else {
+			data.AffectedHolders = holders
+		}
+	}
+
+	if bp.walletConnectionProcessor != nil {
+		pairs, err := bp.walletConnectionProcessor.CaptureAffectedPairs(tx, rollbackSlot)
+		if err != nil {
+			log.Printf("[ROLLBACK] Warning: Failed to capture affected wallet pairs: %v", err)
+		} else {
+			data.AffectedPairs = pairs
+		}
+	}
+
+	return data, nil
+}
+
+// HandleRollback cleans up derived tables AFTER cascade-deleting blocks.
+// Errors are logged as warnings and do not fail the overall rollback.
+func (bp *BlockProcessor) HandleRollback(tx *gorm.DB, rollbackSlot uint64, data *RollbackData) error {
+	// 1. Token transfers — simple slot-based delete
+	if bp.tokenTransferProcessor != nil {
+		if err := bp.tokenTransferProcessor.HandleRollback(tx, rollbackSlot); err != nil {
+			log.Printf("[ROLLBACK] Warning: Token transfer rollback failed: %v", err)
+		}
+	}
+
+	// 2. Wallet connections — delete txs then reaggregate
+	if bp.walletConnectionProcessor != nil && data != nil {
+		if err := bp.walletConnectionProcessor.RecalculateAfterRollback(tx, data.AffectedPairs, rollbackSlot); err != nil {
+			log.Printf("[ROLLBACK] Warning: Wallet connection rollback failed: %v", err)
+		}
+	}
+
+	// 3. Token holders — UTXO-based recalculation
+	if bp.tokenHolderProcessor != nil && data != nil {
+		if err := bp.tokenHolderProcessor.RecalculateAfterRollback(tx, data.AffectedHolders, rollbackSlot); err != nil {
+			log.Printf("[ROLLBACK] Warning: Token holder rollback failed: %v", err)
 		}
 	}
 

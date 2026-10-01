@@ -36,11 +36,11 @@ func TestMakeHolderKey(t *testing.T) {
 func TestTokenHolderEventCreation(t *testing.T) {
 	event := models.TokenHolderEvent{
 		EventType: "balance_increased",
-		Policy:    []byte{0x01, 0x02},
+		Policy:    "0102",
 		Name:      "54455354", // Already hex-encoded
 		Address:   "addr1test",
 		NewAmount: 1000,
-		TxHash:    []byte{0xab, 0xcd},
+		TxHash:    "abcd",
 		Slot:      12345,
 	}
 
